@@ -1,0 +1,1210 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Análisis de Turnos - Intagro SA</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.10/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+  .custom-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+  .custom-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  .custom-scroll::-webkit-scrollbar-track { background: #f1f5f9; }
+</style>
+</head>
+<body class="bg-slate-100">
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+// ==================== HELPERS ====================
+const STORAGE_LOGISTICA = 'analisis_turnos_logistica_cache_v1';
+
+const LOGISTICA_API = 'https://script.google.com/macros/s/AKfycby5tG5QU0kumyN1CnuQRkkjq_2mhQtAcpt9A8MUiElbj8i9PQhX5gqO92e1vy0lRdux1w/exec';
+
+// ==================== SUPABASE (Gestión Logística) ====================
+// Los clientes (razón social / CUIT / repre) se leen directo de la tabla `clientes`
+// de Gestión Logística, que es la fuente única. El alta/baja/edición se hace allá.
+const SUPABASE_URL = 'https://yfmqfafrvgydfnzsllcx.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_2ZCuxfolQ8OfAMnmazA7XQ_wV2EsoFI';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Lee TODA la tabla clientes con paginación (evita el tope de 1000 filas de Supabase).
+async function cargarClientesSupabase() {
+  const pageSize = 1000;
+  let desde = 0, todos = [];
+  for (;;) {
+    const { data, error } = await sb.from('clientes')
+      .select('cliente,cuit,repre_comercial').range(desde, desde + pageSize - 1);
+    if (error) throw error;
+    todos = todos.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    desde += pageSize;
+  }
+  // Mapeamos al shape que ya usa el resto de la app: {cliente, cuit, repre}
+  return todos.map(c => ({ cliente: c.cliente || '', cuit: c.cuit || '', repre: c.repre_comercial || '' }));
+}
+
+// DIAGNÓSTICO 3b: lee quota_alfanumericos + buyer_quotas para comparar el cruce de
+// SIN CTG contra la fuente actual (JSONP). Devuelve un mapa por alfanumérico normalizado.
+async function cargarAlfasSupabase() {
+  const pageSize = 1000;
+  const leerTodo = async (tabla, cols) => {
+    let desde = 0, acc = [];
+    for (;;) {
+      const { data, error } = await sb.from(tabla).select(cols).range(desde, desde + pageSize - 1);
+      if (error) throw error;
+      acc = acc.concat(data || []);
+      if (!data || data.length < pageSize) break;
+      desde += pageSize;
+    }
+    return acc;
+  };
+  const alfas = await leerTodo('quota_alfanumericos', 'code,buyer_quota_id,status');
+  const quotas = await leerTodo('buyer_quotas', 'id,comprador,destinatario,destino,producto,rte_comercial_primaria,rte_comercial_secundaria');
+  const qById = {}; quotas.forEach(q => { qById[q.id] = q; });
+  const map = {};
+  alfas.forEach(a => { const k = normClave(a.code); if (k && !map[k]) map[k] = { code: a.code, status: a.status, quota: qById[a.buyer_quota_id] || null }; });
+  return { map, totalAlfas: alfas.length, totalQuotas: quotas.length };
+}
+
+const normClave = (s) => (s || '').toString().trim().toUpperCase().replace(/\s+/g, '');
+const normTexto = (s) => (s || '').toString().trim().toUpperCase()
+  .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^A-Z0-9]/g, '');
+
+// Convierte el nombre abreviado de Logística al nombre canónico usado en el ABM.
+// Ej.: "Ger Valverdi" -> "GERMAN VALVERDI"; "Diego Abello" -> "ABELLO DIEGO GASTON".
+const resolverRepreABM = (nombreLogistica, nombresAbm) => {
+  const raw = (nombreLogistica || '').toString().trim();
+  if (!raw) return '';
+  const objetivo = normTexto(raw);
+  if (!objetivo) return raw;
+
+  // 1) Coincidencia exacta normalizada.
+  const exacto = nombresAbm.find(n => normTexto(n) === objetivo);
+  if (exacto) return exacto;
+
+  const palabrasLog = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
+  if (!palabrasLog.length) return raw;
+
+  // 2) Apellido + nombre/prefijo, sin importar el orden.
+  const candidatos = nombresAbm.map(n => {
+    const palabrasAbm = n.normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase().replace(/[^A-Z0-9 ]/g, ' ').split(/\s+/).filter(Boolean);
+    let score = 0;
+    palabrasLog.forEach(p => {
+      const match = palabrasAbm.some(a => a === p || (p.length >= 3 && a.startsWith(p)) || (a.length >= 3 && p.startsWith(a)));
+      if (match) score++;
+    });
+    return { nombre:n, score, total:palabrasLog.length };
+  }).filter(x => x.score > 0)
+    .sort((a,b) => b.score-a.score || a.nombre.localeCompare(b.nombre));
+
+  if (candidatos.length && candidatos[0].score === candidatos[0].total &&
+      (!candidatos[1] || candidatos[1].score < candidatos[0].score)) {
+    return candidatos[0].nombre;
+  }
+
+  // Si no hay equivalencia inequívoca, conservamos el texto de Logística.
+  return raw;
+};
+
+// JSONP evita los problemas CORS al abrir esta herramienta directamente como archivo local.
+function cargarLogisticaJSONP() {
+  return new Promise((resolve, reject) => {
+    const cb = '__logistica_cb_' + Date.now() + '_' + Math.floor(Math.random()*100000);
+    const script = document.createElement('script');
+    const timer = setTimeout(() => limpiar(new Error('Tiempo de espera agotado al consultar Logística.')), 60000);
+    const limpiar = (err, data) => {
+      clearTimeout(timer);
+      try { delete window[cb]; } catch(e) { window[cb] = undefined; }
+      if (script.parentNode) script.parentNode.removeChild(script);
+      err ? reject(err) : resolve(data);
+    };
+    window[cb] = (data) => limpiar(null, data);
+    script.onerror = () => limpiar(new Error('No se pudo conectar con la API de Logística.'));
+    script.src = LOGISTICA_API + '?callback=' + encodeURIComponent(cb) + '&_=' + Date.now();
+    document.head.appendChild(script);
+  });
+}
+
+// Limpia "30715118773 MOLINOS AGRO S.A." -> "MOLINOS AGRO S.A."
+const limpiarCuit = (s) => {
+  if (!s) return '';
+  return s.toString().replace(/^\s*\d{11}\s+/, '').trim();
+};
+// Extrae el CUIT (solo dígitos) de "30715118773 MOLINOS AGRO S.A." -> "30715118773"
+const extraerCuit = (s) => {
+  if (!s) return '';
+  const m = s.toString().match(/\d{11}/);
+  return m ? m[0] : '';
+};
+// Normaliza cualquier CUIT a solo dígitos
+const normCuit = (s) => (s || '').toString().replace(/[^0-9]/g, '');
+// Limpia "19-Maiz" -> "MAIZ"
+const limpiarProducto = (s) => {
+  if (!s) return '';
+  return s.toString().replace(/^\d+\s*-\s*/, '').trim().toUpperCase();
+};
+// "01/09/2026 19:00 - 20:00" -> "2026-09-01" (ISO para ordenar/comparar)
+const parseFecha = (s) => {
+  if (!s) return null;
+  const str = s.toString().trim();
+  const m = str.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  if (m) return `${m[3]}-${m[2]}-${m[1]}`;
+  // por si viene como Date
+  if (s instanceof Date && !isNaN(s)) return s.toISOString().slice(0,10);
+  return null;
+};
+const fechaDisplay = (iso) => {
+  if (!iso) return '';
+  const [y,m,d] = iso.split('-');
+  return `${d}/${m}/${y}`;
+};
+const esIncumplido = (estado) => (estado || '').toUpperCase().includes('SIN CTG');
+
+const MESES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+const DIAS_SEMANA = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo'];
+
+// Lunes de la semana de una fecha dada (Date)
+const getLunes = (fecha) => {
+  const d = new Date(fecha);
+  const day = (d.getDay() + 6) % 7; // 0 = lunes
+  d.setDate(d.getDate() - day);
+  d.setHours(0,0,0,0);
+  return d;
+};
+const isoDeDate = (d) => {
+  const y = d.getFullYear(), m = String(d.getMonth()+1).padStart(2,'0'), dd = String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${dd}`;
+};
+
+const pct = (parte, total) => total > 0 ? Math.round((parte/total)*100) : 0;
+
+// ==================== ICONOS ====================
+const Icon = ({d, className='w-4 h-4'}) => <svg xmlns="http://www.w3.org/2000/svg" className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">{d}</svg>;
+const IconUpload = (p) => <Icon {...p} d={<><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></>} />;
+const IconCal = (p) => <Icon {...p} d={<><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></>} />;
+const IconGrid = (p) => <Icon {...p} d={<><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></>} />;
+const IconLeft = (p) => <Icon {...p} d={<polyline points="15 18 9 12 15 6"/>} />;
+const IconRight = (p) => <Icon {...p} d={<polyline points="9 18 15 12 9 6"/>} />;
+const IconTrash = (p) => <Icon {...p} d={<><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></>} />;
+const IconUsers = (p) => <Icon {...p} d={<><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></>} />;
+const IconX = (p) => <Icon {...p} d={<><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>} />;
+const IconEdit = (p) => <Icon {...p} d={<><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></>} />;
+
+// ==================== PARSEO DEL EXCEL ====================
+function parseExcel(arrayBuffer) {
+  const wb = XLSX.read(arrayBuffer, { type: 'array' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  // Buscar fila de encabezados (contiene 'Id Turno Terminal')
+  let hIdx = -1;
+  for (let i = 0; i < Math.min(rows.length, 15); i++) {
+    if (rows[i].some(c => (c||'').toString().trim() === 'Id Turno Terminal')) { hIdx = i; break; }
+  }
+  if (hIdx === -1) throw new Error("No se encontró la columna 'Id Turno Terminal'. ¿Es el Excel del STOP?");
+  const headers = rows[hIdx].map(h => (h||'').toString().trim());
+  const col = (name) => headers.indexOf(name);
+  const idx = {
+    estado: col('Estado'), id: col('Id Turno Terminal'), fecha: col('Fecha'),
+    grano: col('Grano'), destino: col('Destino'), destinatario: col('Destinatario'),
+    ctg: col('CTG'), origen: col('Origen'), contrato: col('N° Contrato'),
+    intermediario: col('Intermediario'), rttecom: col('Rtte. Comercial'),
+    localidadDestino: col('Localidad Destino')
+  };
+  const registros = [];
+  for (let i = hIdx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const id = (r[idx.id]||'').toString().trim();
+    if (!id) continue;
+    registros.push({
+      id,
+      estado: (r[idx.estado]||'').toString().trim(),
+      fecha: parseFecha(r[idx.fecha]),
+      producto: limpiarProducto(r[idx.grano]),
+      destino: limpiarCuit(r[idx.destino]),
+      localidadDestino: (r[idx.localidadDestino]||'').toString().trim(),
+      comprador: limpiarCuit(r[idx.destinatario]),
+      ctg: (r[idx.ctg]||'').toString().trim(),
+      origen: limpiarCuit(r[idx.origen]),
+      origenCuit: extraerCuit(r[idx.origen]),
+      intermediario: limpiarCuit(r[idx.intermediario]),
+      intermediarioCuit: extraerCuit(r[idx.intermediario]),
+      rtteComercial: limpiarCuit(r[idx.rttecom]),
+      rtteComercialCuit: extraerCuit(r[idx.rttecom]),
+      contrato: (r[idx.contrato]||'').toString().trim(),
+    });
+  }
+  return registros;
+}
+
+// ==================== SUPABASE: turnos STOP ====================
+// Mapea un registro del Excel al shape de la tabla turnos_stop.
+const turnoToRow = (r) => ({
+  id_turno_terminal: r.id,
+  estado: r.estado || '',
+  fecha: r.fecha || null,
+  producto: r.producto || '',
+  destino: r.destino || '',
+  localidad_destino: r.localidadDestino || '',
+  comprador: r.comprador || '',
+  ctg: r.ctg || '',
+  origen: r.origen || '',
+  origen_cuit: r.origenCuit || '',
+  intermediario: r.intermediario || '',
+  intermediario_cuit: r.intermediarioCuit || '',
+  rtte_comercial: r.rtteComercial || '',
+  rtte_comercial_cuit: r.rtteComercialCuit || '',
+  contrato: r.contrato || ''
+});
+
+// Mapea una fila de Supabase al shape interno de la app.
+const rowToTurno = (r) => ({
+  id: r.id_turno_terminal,
+  estado: r.estado || '',
+  fecha: r.fecha || null,
+  producto: r.producto || '',
+  destino: r.destino || '',
+  localidadDestino: r.localidad_destino || '',
+  comprador: r.comprador || '',
+  ctg: r.ctg || '',
+  origen: r.origen || '',
+  origenCuit: r.origen_cuit || '',
+  intermediario: r.intermediario || '',
+  intermediarioCuit: r.intermediario_cuit || '',
+  rtteComercial: r.rtte_comercial || '',
+  rtteComercialCuit: r.rtte_comercial_cuit || '',
+  contrato: r.contrato || ''
+});
+
+// Lee TODOS los turnos con paginación.
+async function cargarTurnosSupabase() {
+  const pageSize = 1000;
+  let desde = 0, todos = [];
+  for (;;) {
+    const { data, error } = await sb.from('turnos_stop')
+      .select('*').range(desde, desde + pageSize - 1);
+    if (error) throw error;
+    todos = todos.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    desde += pageSize;
+  }
+  return todos;
+}
+
+// Upsert en lotes de 50 con pausa entre cada uno para no saturar la conexión.
+async function upsertTurnosSupabase(registros, onProgreso) {
+  const rows = registros.map(turnoToRow);
+  const batchSize = 50;
+  let enviados = 0;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const lote = rows.slice(i, i + batchSize);
+    const { error } = await sb.from('turnos_stop')
+      .upsert(lote, { onConflict: 'id_turno_terminal' });
+    if (error) throw error;
+    enviados += lote.length;
+    if (onProgreso) onProgreso(enviados, rows.length);
+    // Pausa de 150ms entre lotes para evitar "Failed to fetch"
+    if (i + batchSize < rows.length) await new Promise(r => setTimeout(r, 150));
+  }
+}
+
+// ==================== APP ====================
+function App() {
+  const [data, setData] = useState({}); // { id: registro }
+  const [turnosEstado, setTurnosEstado] = useState('cargando');
+  const [turnosError, setTurnosError] = useState('');
+  const [clientes, setClientes] = useState([]); // [{cliente, cuit, repre}] leídos de Supabase
+  const [clientesEstado, setClientesEstado] = useState('cargando');
+  const [clientesError, setClientesError] = useState('');
+  const [tab, setTab] = useState('detalle');
+  const [processing, setProcessing] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [showAbm, setShowAbm] = useState(false);
+  const [showDiag, setShowDiag] = useState(false);
+  const [supaLog, setSupaLog] = useState({ map:{}, totalAlfas:0, totalQuotas:0 });
+  const [supaLogEstado, setSupaLogEstado] = useState('cargando');
+  const [supaLogError, setSupaLogError] = useState('');
+  const [logistica, setLogistica] = useState([]);
+  const [logisticaEstado, setLogisticaEstado] = useState('cargando');
+  const [logisticaActualizada, setLogisticaActualizada] = useState(null);
+  const [logisticaError, setLogisticaError] = useState('');
+
+  // Turnos: se leen de Supabase y se escuchan cambios en tiempo real.
+  const cargarTurnos = async () => {
+    setTurnosEstado('cargando'); setTurnosError('');
+    try {
+      const rows = await cargarTurnosSupabase();
+      const obj = {};
+      rows.forEach(r => { const t = rowToTurno(r); obj[t.id] = t; });
+      setData(obj);
+      setLastUpdate(new Date().toISOString());
+      setTurnosEstado('ok');
+    } catch(e) {
+      console.error('Error cargando turnos de Supabase', e);
+      setTurnosError(e.message || 'No se pudo leer turnos.');
+      setTurnosEstado('error');
+    }
+  };
+  useEffect(() => {
+    cargarTurnos();
+    const ch = sb.channel('rt_turnos_stop')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'turnos_stop' }, () => cargarTurnos())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, []);
+
+  // Clientes: se leen de Supabase (Gestión Logística) al abrir y con el botón de refresco.
+  const cargarClientes = async () => {
+    setClientesEstado('cargando'); setClientesError('');
+    try {
+      const lista = await cargarClientesSupabase();
+      setClientes(lista);
+      setClientesEstado('ok');
+    } catch(e) {
+      console.error('Error cargando clientes de Supabase', e);
+      setClientesError(e.message || 'No se pudo leer la tabla de clientes.');
+      setClientesEstado('error');
+    }
+  };
+  useEffect(() => { cargarClientes(); }, []);
+
+  const cargarSupaLog = async () => {
+    setSupaLogEstado('cargando'); setSupaLogError('');
+    try {
+      const res = await cargarAlfasSupabase();
+      setSupaLog(res);
+      setSupaLogEstado('ok');
+    } catch(e) {
+      console.error('Error leyendo alfanuméricos de Supabase', e);
+      setSupaLogError(e.message || 'No se pudo leer quota_alfanumericos.');
+      setSupaLogEstado('error');
+    }
+  };
+  useEffect(() => { cargarSupaLog(); }, []);
+
+
+  const refrescoEnCurso = useRef(false);
+  // El setInterval captura la primera versión de refrescarLogistica (con logistica=[]).
+  // Este ref siempre refleja la cantidad actual, así el chequeo posterior no queda obsoleto.
+  const logisticaLenRef = useRef(0);
+  useEffect(() => { logisticaLenRef.current = logistica.length; }, [logistica]);
+
+  const refrescarLogistica = async (silencioso=false) => {
+    // Evita consultas simultáneas si una respuesta de Apps Script viene lenta.
+    if (refrescoEnCurso.current) return;
+    refrescoEnCurso.current = true;
+    if (!silencioso && logisticaLenRef.current === 0) setLogisticaEstado('cargando');
+    setLogisticaError('');
+
+    let ultimoError = null;
+    // Reintento automático: ya no hace falta hacer clic cuando Apps Script falla transitoriamente.
+    for (let intento = 1; intento <= 2; intento++) {
+      try {
+        const resp = await cargarLogisticaJSONP();
+        if (!resp || resp.ok !== true || !Array.isArray(resp.registros)) {
+          throw new Error((resp && resp.error) || 'Respuesta inválida de la API.');
+        }
+        const actualizado = resp.actualizado || new Date().toISOString();
+        setLogistica(resp.registros);
+        setLogisticaActualizada(actualizado);
+        setLogisticaEstado('ok');
+        try {
+          localStorage.setItem(STORAGE_LOGISTICA, JSON.stringify({registros:resp.registros, actualizado}));
+        } catch(e) { console.warn('No se pudo guardar caché de Logística', e); }
+        refrescoEnCurso.current = false;
+        return;
+      } catch (err) {
+        ultimoError = err;
+        console.warn(`Intento ${intento}/2 de Logística falló`, err);
+        if (intento < 2) await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    // Si ya tenemos una copia válida, la conservamos y seguimos operando sin bloquear la herramienta.
+    if (logisticaLenRef.current > 0) {
+      setLogisticaEstado('ok');
+      setLogisticaError('Actualización pendiente: se conserva la última copia válida.');
+    } else {
+      setLogisticaEstado('error');
+      setLogisticaError((ultimoError && ultimoError.message) || 'No se pudo conectar con Logística.');
+    }
+    refrescoEnCurso.current = false;
+  };
+
+  useEffect(() => {
+    // Mostrar inmediatamente la última copia exitosa, mientras en segundo plano buscamos cambios.
+    try {
+      const cache = JSON.parse(localStorage.getItem(STORAGE_LOGISTICA) || 'null');
+      if (cache && Array.isArray(cache.registros) && cache.registros.length) {
+        setLogistica(cache.registros);
+        setLogisticaActualizada(cache.actualizado || null);
+        setLogisticaEstado('ok');
+      }
+    } catch(e) { console.warn('Caché de Logística inválida', e); }
+
+    const inicio = setTimeout(() => refrescarLogistica(true), 250);
+    // 5 minutos reduce carga sobre Apps Script; cada ciclo ya tiene reintento automático.
+    const t = setInterval(() => refrescarLogistica(true), 300000);
+    return () => { clearTimeout(inicio); clearInterval(t); };
+  }, []);
+
+  // Mapa CUIT -> repre para el cruce rápido
+  const mapaRepre = useMemo(() => {
+    const m = {};
+    clientes.forEach(c => { const k = normCuit(c.cuit); if (k) m[k] = c.repre || ''; });
+    return m;
+  }, [clientes]);
+
+  // Nombres canónicos de representantes/comerciales definidos en el ABM.
+  const nombresRepreAbm = useMemo(() => [...new Set(clientes.map(c => (c.repre || '').trim()).filter(Boolean))], [clientes]);
+
+  const [uploadProg, setUploadProg] = useState('');
+
+  const handleUpload = async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    setProcessing(true);
+    setUploadProg('Leyendo Excel...');
+    try {
+      const buf = await file.arrayBuffer();
+      const registros = parseExcel(buf);
+      if (registros.length === 0) { alert('No se encontraron turnos en el archivo.'); setProcessing(false); setUploadProg(''); return; }
+      await upsertTurnosSupabase(registros, (env, tot) => {
+        setUploadProg(`Subiendo ${env} de ${tot}...`);
+      });
+      setUploadProg('Recargando...');
+      let nuevos = 0, actualizados = 0;
+      registros.forEach(reg => { if (data[reg.id]) actualizados++; else nuevos++; });
+      await cargarTurnos();
+      setUploadProg('');
+      alert(`✅ Importación completa.\nNuevos: ${nuevos}\nActualizados: ${actualizados}\nTotal en sistema: ${Object.keys(data).length}`);
+    } catch(err) {
+      alert('Error al procesar el Excel: ' + err.message);
+    } finally {
+      setProcessing(false);
+      setUploadProg('');
+    }
+  };
+
+  const borrarTodo = async () => {
+    if (!window.confirm('¿Borrar TODOS los turnos? Esta acción no se puede deshacer.')) return;
+    try {
+      const { error } = await sb.from('turnos_stop').delete().neq('id_turno_terminal', '');
+      if (error) throw error;
+      setData({});
+      setLastUpdate(null);
+    } catch(e) {
+      alert('Error al borrar: ' + e.message);
+    }
+  };
+
+  const mapaLogistica = useMemo(() => {
+    const m = {};
+    logistica.forEach(x => {
+      // Intentamos por ambos campos: STOP y código de Logística.
+      [x.stop, x.codigo].forEach(v => {
+        const k = normClave(v);
+        if (k && !m[k]) m[k] = x;
+      });
+    });
+    return m;
+  }, [logistica]);
+
+  const registros = useMemo(() => Object.values(data).map(r => {
+    // Para turnos normales, buscamos el Repre/Comercial en el ABM por todas las partes del turno.
+    // Prioridad: Rtte. Comercial -> Intermediario -> Origen.
+    const cuitRtte = normCuit(r.rtteComercialCuit);
+    const cuitInter = normCuit(r.intermediarioCuit);
+    const cuitOrigen = normCuit(r.origenCuit);
+    const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
+    // Validamos TODOS los alfanuméricos contra Logística.
+    const logEncontrado = mapaLogistica[normClave(r.id)] || null;
+    // Para SIN CTG usamos Logística como fuente principal.
+    // Para turnos normales, primero intentamos resolver por ABM; si no hay vendedor en ABM
+    // pero el alfa existe en Logística, usamos el Repre/Comercial informado allí.
+    const log = esIncumplido(r.estado) ? logEncontrado : null;
+    const repreLogisticaOriginal = logEncontrado ? (logEncontrado.repreCom || '') : '';
+    const repreLogisticaCanonico = repreLogisticaOriginal ? resolverRepreABM(repreLogisticaOriginal, nombresRepreAbm) : '';
+    const repreFinal = esIncumplido(r.estado)
+      ? (repreLogisticaCanonico || '')
+      : (repreAbm || repreLogisticaCanonico || '');
+    return {
+      ...r,
+      logistica: logEncontrado,
+      clienteLogistica: log ? (log.cliente || '') : '',
+      repreLogistica: repreLogisticaCanonico,
+      repre: repreFinal,
+      cruceLogistica: log ? 'encontrado' : (esIncumplido(r.estado) ? 'sin_coincidencia' : '')
+    };
+  }), [data, mapaRepre, mapaLogistica, nombresRepreAbm]);
+
+  return (
+    <div className="min-h-screen flex flex-col">
+      {/* HEADER */}
+      <div className="bg-gradient-to-r from-emerald-800 to-emerald-700 text-white px-4 py-3 shadow-md">
+        <div className="flex items-center justify-between flex-wrap gap-2">
+          <div className="flex items-center gap-2">
+            <div className="bg-white/15 p-1.5 rounded-lg"><IconGrid className="w-5 h-5"/></div>
+            <div>
+              <h1 className="font-black text-base leading-tight">ANÁLISIS DE TURNOS</h1>
+              <p className="text-[10px] text-emerald-200 uppercase tracking-wide">Intagro SA · Satélite STOP</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className={`text-[11px] font-bold px-2 py-1 rounded ${turnosEstado==='ok'?'bg-emerald-900/40 text-emerald-100':turnosEstado==='error'?'bg-red-900/50 text-red-100':'bg-amber-900/40 text-amber-100'}`}>
+              {turnosEstado==='ok' ? `${registros.length} turnos` : turnosEstado==='error' ? 'Turnos ERROR' : 'Cargando turnos...'} {lastUpdate && `· ${new Date(lastUpdate).toLocaleString('es-AR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}`}
+            </span>
+            <button onClick={() => refrescarLogistica(false)} className={`text-[11px] font-bold px-2 py-1 rounded border ${logisticaEstado==='ok'?'bg-emerald-900/40 border-emerald-500/40 text-emerald-100':logisticaEstado==='error'?'bg-red-900/50 border-red-400/40 text-red-100':'bg-amber-900/40 border-amber-400/40 text-amber-100'}`} title={logisticaEstado==='error'?logisticaError:'Actualizar Logística ahora'}>
+              {logisticaEstado==='ok' ? `● Logística ${logistica.length}` : logisticaEstado==='error' ? '● Logística ERROR' : '● Conectando Logística...'}
+            </button>
+            <label className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition shadow-sm ${processing ? 'bg-slate-400 cursor-wait' : 'bg-white text-emerald-800 hover:bg-emerald-50'}`}>
+              <IconUpload className="w-4 h-4"/>{processing ? (uploadProg || 'Procesando...') : 'Subir Excel STOP'}
+              <input type="file" accept=".xlsx,.xls" onChange={handleUpload} disabled={processing} className="hidden"/>
+            </label>
+            <button onClick={()=>setShowAbm(true)} className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm border ${clientesEstado==='ok'?'bg-emerald-900/50 text-white hover:bg-emerald-900/70 border-emerald-600/40':clientesEstado==='error'?'bg-red-900/50 text-red-100 border-red-400/40':'bg-amber-900/40 text-amber-100 border-amber-400/40'}`} title={clientesEstado==='error'?('Clientes: '+clientesError):'Ver clientes / representantes (se editan en Gestión Logística)'}>
+              <IconUsers className="w-4 h-4"/> Clientes {clientesEstado==='ok' ? clientes.length : clientesEstado==='error' ? 'ERROR' : '...'}
+            </button>
+            <button onClick={()=>setShowDiag(true)} className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm border ${supaLogEstado==='ok'?'bg-indigo-900/50 text-indigo-100 hover:bg-indigo-900/70 border-indigo-500/40':supaLogEstado==='error'?'bg-red-900/50 text-red-100 border-red-400/40':'bg-amber-900/40 text-amber-100 border-amber-400/40'}`} title="Diagnóstico: comparar cruce SIN CTG entre JSONP y Supabase">
+              Diag. {supaLogEstado==='ok' ? supaLog.totalAlfas : supaLogEstado==='error' ? 'ERROR' : '...'}
+            </button>
+            <button onClick={borrarTodo} className="bg-red-900/40 hover:bg-red-700 text-red-100 p-1.5 rounded-lg transition" title="Borrar todos los datos"><IconTrash className="w-4 h-4"/></button>
+          </div>
+        </div>
+      </div>
+
+      {/* TABS */}
+      <div className="bg-white border-b border-slate-200 px-4 flex gap-1">
+        <button onClick={()=>setTab('detalle')} className={`px-4 py-2.5 text-sm font-bold border-b-2 transition flex items-center gap-1.5 ${tab==='detalle' ? 'border-emerald-600 text-emerald-700' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>
+          <IconGrid className="w-4 h-4"/> Detalle de Turnos
+        </button>
+        <button onClick={()=>setTab('semanal')} className={`px-4 py-2.5 text-sm font-bold border-b-2 transition flex items-center gap-1.5 ${tab==='semanal' ? 'border-emerald-600 text-emerald-700' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>
+          <IconCal className="w-4 h-4"/> Vista Semanal Compradores
+        </button>
+        <button onClick={()=>setTab('semanalRepre')} className={`px-4 py-2.5 text-sm font-bold border-b-2 transition flex items-center gap-1.5 ${tab==='semanalRepre' ? 'border-emerald-600 text-emerald-700' : 'border-transparent text-slate-400 hover:text-slate-600'}`}>
+          <IconUsers className="w-4 h-4"/> Vista Semanal Repre/Comercial
+        </button>
+      </div>
+
+      <div className="flex-1 p-4 overflow-hidden">
+        {registros.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center text-slate-400">
+            <IconUpload className="w-12 h-12 mb-3 opacity-40"/>
+            <p className="font-bold">No hay datos cargados</p>
+            <p className="text-sm">Subí un Excel del STOP para empezar.</p>
+          </div>
+        ) : tab === 'detalle' ? <DetalleTab registros={registros}/> : tab === 'semanal' ? <SemanalTab registros={registros}/> : <SemanalRepreTab registros={registros}/>}
+      </div>
+
+      {showAbm && <VisorClientes clientes={clientes} estado={clientesEstado} error={clientesError} onRefresh={cargarClientes} onClose={()=>setShowAbm(false)}/>}
+      {showDiag && <DiagLogistica registros={registros} logisticaMap={mapaLogistica} logisticaCount={logistica.length} supaLog={supaLog} estado={supaLogEstado} error={supaLogError} onRefresh={cargarSupaLog} onClose={()=>setShowDiag(false)}/>}
+    </div>
+  );
+}
+
+// ==================== ABM CLIENTES ====================
+// ==================== VISOR CLIENTES (solo lectura, fuente = Supabase Gestión Logística) ====================
+function VisorClientes({ clientes, estado, error, onRefresh, onClose }) {
+  const [search, setSearch] = useState('');
+  const filtrada = clientes.filter(c => !search ||
+    (c.cliente||'').toLowerCase().includes(search.toLowerCase()) ||
+    (c.cuit||'').includes(search) ||
+    (c.repre||'').toLowerCase().includes(search.toLowerCase()));
+  const inp = "p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-emerald-500";
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col" onClick={e=>e.stopPropagation()}>
+        <div className="bg-emerald-800 text-white px-4 py-3 rounded-t-xl flex justify-between items-center">
+          <h3 className="font-bold flex items-center gap-2"><IconUsers className="w-5 h-5"/> Clientes / Representantes</h3>
+          <button onClick={onClose} className="hover:bg-white/20 p-1 rounded"><IconX className="w-5 h-5"/></button>
+        </div>
+
+        <div className="px-4 py-2 border-b border-slate-100 bg-amber-50 text-[11px] text-amber-800">
+          Solo lectura. Esta tabla se lee de <b>Gestión Logística</b> (Supabase). El alta, la edición y la baja de clientes se hacen en esa herramienta; acá se refleja automáticamente.
+        </div>
+
+        <div className="px-4 py-2 border-b border-slate-100 flex items-center gap-2 flex-wrap">
+          <input placeholder="Buscar por cliente, CUIT o repre..." value={search} onChange={e=>setSearch(e.target.value)} className={inp+" flex-1 max-w-xs"}/>
+          <span className="text-xs text-slate-500">{filtrada.length} de {clientes.length}</span>
+          <button onClick={onRefresh} disabled={estado==='cargando'} className="ml-auto text-xs font-bold text-emerald-700 border border-emerald-300 rounded px-3 py-1.5 hover:bg-emerald-50 disabled:opacity-50">
+            {estado==='cargando' ? 'Actualizando...' : 'Actualizar'}
+          </button>
+          <span className={`text-[11px] font-bold px-2 py-1 rounded ${estado==='ok'?'bg-emerald-100 text-emerald-700':estado==='error'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
+            {estado==='ok' ? '● Conectado' : estado==='error' ? '● Error' : '● Conectando...'}
+          </span>
+        </div>
+
+        {estado==='error' && <div className="px-4 py-2 text-xs text-red-600 bg-red-50 border-b border-red-100">{error}</div>}
+
+        <div className="flex-1 overflow-auto custom-scroll">
+          <table className="w-full text-left text-xs border-collapse">
+            <thead className="sticky top-0 bg-slate-100"><tr>{['Cliente','CUIT','Repre/Comercial'].map(h=><th key={h} className="p-2 font-bold text-slate-600 border-b border-slate-200">{h}</th>)}</tr></thead>
+            <tbody>
+              {filtrada.map((c,i)=>(
+                <tr key={i} className="even:bg-slate-50 hover:bg-emerald-50">
+                  <td className="p-2 border-b border-slate-100 font-bold text-slate-700">{c.cliente}</td>
+                  <td className="p-2 border-b border-slate-100 font-mono">{c.cuit || <span className="text-slate-300">—</span>}</td>
+                  <td className="p-2 border-b border-slate-100">{c.repre || <span className="text-slate-300">—</span>}</td>
+                </tr>
+              ))}
+              {filtrada.length===0 && <tr><td colSpan="3" className="p-8 text-center text-slate-400 italic">{estado==='cargando'?'Cargando clientes...':'No hay clientes para mostrar.'}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="p-3 border-t border-slate-200 flex justify-end gap-2 bg-slate-50 rounded-b-xl">
+          <button onClick={onClose} className="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold px-5 py-2 rounded-lg">Cerrar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==================== DIAGNÓSTICO 3b: JSONP vs SUPABASE ====================
+// Compara, sobre los turnos SIN CTG (los que dependen del cruce con Logística),
+// cuántos matchean en la fuente actual (JSONP) y cuántos en Supabase.
+// El objetivo es confirmar que Supabase cubre todo ANTES de sacar el JSONP.
+function DiagLogistica({ registros, logisticaMap, logisticaCount, supaLog, estado, error, onRefresh, onClose }) {
+  const stats = useMemo(() => {
+    const sinctg = registros.filter(r => esIncumplido(r.estado));
+    let ambos=0, soloJsonp=0, soloSupa=0, ninguno=0;
+    const listaSoloJsonp=[], listaSoloSupa=[], muestraMatch=[];
+    sinctg.forEach(r => {
+      const k = normClave(r.id);
+      const j = logisticaMap[k] || null;
+      const s = supaLog.map[k] || null;
+      if (j && s) { ambos++; if (muestraMatch.length<20) muestraMatch.push({r,j,s}); }
+      else if (j && !s) { soloJsonp++; if (listaSoloJsonp.length<25) listaSoloJsonp.push(r.id); }
+      else if (!j && s) { soloSupa++; if (listaSoloSupa.length<25) listaSoloSupa.push(r.id); }
+      else ninguno++;
+    });
+    return { totalSinctg:sinctg.length, matchJsonp:ambos+soloJsonp, matchSupa:ambos+soloSupa, ambos, soloJsonp, soloSupa, ninguno, listaSoloJsonp, listaSoloSupa, muestraMatch };
+  }, [registros, logisticaMap, supaLog]);
+
+  const Card = ({label, val, cls}) => (
+    <div className={`rounded-lg border p-3 text-center ${cls}`}>
+      <div className="text-2xl font-black">{val}</div>
+      <div className="text-[10px] font-bold uppercase tracking-wide opacity-80">{label}</div>
+    </div>
+  );
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50" onClick={onClose}>
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-5xl max-h-[92vh] flex flex-col" onClick={e=>e.stopPropagation()}>
+        <div className="bg-indigo-800 text-white px-4 py-3 rounded-t-xl flex justify-between items-center">
+          <h3 className="font-bold flex items-center gap-2"><IconGrid className="w-5 h-5"/> Diagnóstico cruce SIN CTG · JSONP vs Supabase</h3>
+          <button onClick={onClose} className="hover:bg-white/20 p-1 rounded"><IconX className="w-5 h-5"/></button>
+        </div>
+
+        <div className="px-4 py-2 border-b border-slate-100 flex items-center gap-3 flex-wrap text-[11px]">
+          <span className="text-slate-600">JSONP cargó <b>{logisticaCount}</b> registros · Supabase cargó <b>{supaLog.totalAlfas}</b> alfanuméricos / <b>{supaLog.totalQuotas}</b> cupos</span>
+          <button onClick={onRefresh} disabled={estado==='cargando'} className="ml-auto text-xs font-bold text-indigo-700 border border-indigo-300 rounded px-3 py-1.5 hover:bg-indigo-50 disabled:opacity-50">
+            {estado==='cargando' ? 'Leyendo Supabase...' : 'Releer Supabase'}
+          </button>
+          <span className={`text-[11px] font-bold px-2 py-1 rounded ${estado==='ok'?'bg-emerald-100 text-emerald-700':estado==='error'?'bg-red-100 text-red-700':'bg-amber-100 text-amber-700'}`}>
+            {estado==='ok' ? '● Supabase OK' : estado==='error' ? '● Error' : '● Leyendo...'}
+          </span>
+        </div>
+        {estado==='error' && <div className="px-4 py-2 text-xs text-red-600 bg-red-50 border-b border-red-100">{error}</div>}
+
+        <div className="flex-1 overflow-auto custom-scroll p-4 space-y-4">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            <Card label="SIN CTG totales" val={stats.totalSinctg} cls="bg-slate-50 border-slate-200 text-slate-700"/>
+            <Card label="Matchean en JSONP" val={stats.matchJsonp} cls="bg-emerald-50 border-emerald-200 text-emerald-700"/>
+            <Card label="Matchean en Supabase" val={stats.matchSupa} cls="bg-indigo-50 border-indigo-200 text-indigo-700"/>
+            <Card label="En NINGUNA fuente" val={stats.ninguno} cls="bg-slate-50 border-slate-200 text-slate-400"/>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+            <Card label="En ambas" val={stats.ambos} cls="bg-emerald-50 border-emerald-200 text-emerald-700"/>
+            <Card label="Solo JSONP (se perderían)" val={stats.soloJsonp} cls={stats.soloJsonp>0?"bg-red-50 border-red-300 text-red-700":"bg-slate-50 border-slate-200 text-slate-400"}/>
+            <Card label="Solo Supabase (ganaríamos)" val={stats.soloSupa} cls="bg-blue-50 border-blue-200 text-blue-700"/>
+          </div>
+
+          <div className="text-[11px] text-slate-500 bg-amber-50 border border-amber-200 rounded p-2">
+            <b>Cómo leerlo:</b> si "Solo JSONP" es <b>0</b>, Supabase cubre todo lo que hoy cubre el JSONP y es seguro sacarlo.
+            Si es mayor a 0, esos alfanuméricos existen en la fuente vieja pero no en Supabase (formato distinto o no cargados) y los perderíamos.
+          </div>
+
+          {stats.soloJsonp>0 && (
+            <div>
+              <div className="text-xs font-bold text-red-700 mb-1">Alfanuméricos que matchean SOLO en JSONP (muestra):</div>
+              <div className="flex flex-wrap gap-1">
+                {stats.listaSoloJsonp.map((id,i)=><span key={i} className="font-mono text-[10px] bg-red-100 text-red-700 px-1.5 py-0.5 rounded">{id}</span>)}
+              </div>
+            </div>
+          )}
+
+          <div>
+            <div className="text-xs font-bold text-slate-700 mb-1">Muestra de coincidencias — comparar campos JSONP vs Supabase para definir el mapeo:</div>
+            <div className="overflow-auto border border-slate-200 rounded">
+              <table className="w-full text-left text-[11px] border-collapse">
+                <thead className="bg-slate-100"><tr>{['Alfanumérico','JSONP cliente','JSONP repreCom','SUPA comprador','SUPA rte_prim','SUPA rte_sec','SUPA destinatario'].map(h=><th key={h} className="p-1.5 font-bold text-slate-600 border-b border-slate-200 whitespace-nowrap">{h}</th>)}</tr></thead>
+                <tbody>
+                  {stats.muestraMatch.map(({r,j,s},i)=>(
+                    <tr key={i} className="even:bg-slate-50">
+                      <td className="p-1.5 border-b border-slate-100 font-mono font-bold">{r.id}</td>
+                      <td className="p-1.5 border-b border-slate-100">{j.cliente||'—'}</td>
+                      <td className="p-1.5 border-b border-slate-100 text-emerald-700 font-bold">{j.repreCom||'—'}</td>
+                      <td className="p-1.5 border-b border-slate-100">{s.quota?(s.quota.comprador||'—'):'(sin cupo)'}</td>
+                      <td className="p-1.5 border-b border-slate-100 text-indigo-700 font-bold">{s.quota?(s.quota.rte_comercial_primaria||'—'):'—'}</td>
+                      <td className="p-1.5 border-b border-slate-100 text-indigo-700">{s.quota?(s.quota.rte_comercial_secundaria||'—'):'—'}</td>
+                      <td className="p-1.5 border-b border-slate-100">{s.quota?(s.quota.destinatario||'—'):'—'}</td>
+                    </tr>
+                  ))}
+                  {stats.muestraMatch.length===0 && <tr><td colSpan="7" className="p-6 text-center text-slate-400 italic">No hay coincidencias en ambas fuentes todavía (subí un STOP y esperá que cargue Supabase).</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-3 border-t border-slate-200 flex justify-end gap-2 bg-slate-50 rounded-b-xl">
+          <button onClick={onClose} className="bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold px-5 py-2 rounded-lg">Cerrar</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ==================== TAB DETALLE ====================
+function DetalleTab({ registros }) {
+  const [fDesde, setFDesde] = useState('');
+  const [fHasta, setFHasta] = useState('');
+  const [fDia, setFDia] = useState(() => isoDeDate(new Date()));
+  const [fProducto, setFProducto] = useState('');
+  const [fDestino, setFDestino] = useState('');
+  const [fRepre, setFRepre] = useState('');
+  const [fOrigen, setFOrigen] = useState('');
+  const [fInter, setFInter] = useState('');
+  const [fClienteLog, setFClienteLog] = useState('');
+  const [fEstado, setFEstado] = useState('');
+  const [fEnLogistica, setFEnLogistica] = useState('');
+  const [fCumplimiento, setFCumplimiento] = useState('');
+
+  const productos = useMemo(() => [...new Set(registros.map(r=>r.producto).filter(Boolean))].sort(), [registros]);
+  const destinos = useMemo(() => [...new Set(registros.map(r=>r.destino).filter(Boolean))].sort(), [registros]);
+  const repres = useMemo(() => [...new Set(registros.map(r=>r.repre).filter(Boolean))].sort(), [registros]);
+  const origenes = useMemo(() => [...new Set(registros.map(r=>r.origen).filter(Boolean))].sort(), [registros]);
+  const intermediarios = useMemo(() => [...new Set(registros.map(r=>r.intermediario).filter(Boolean))].sort(), [registros]);
+  const clientesLog = useMemo(() => [...new Set(registros.map(r=>r.clienteLogistica).filter(Boolean))].sort(), [registros]);
+  const estados = useMemo(() => [...new Set(registros.map(r=>r.estado).filter(Boolean))].sort(), [registros]);
+
+  const filtradosBase = useMemo(() => {
+    return registros.filter(r => {
+      if (fDia && r.fecha !== fDia) return false;
+      if (fDesde && (!r.fecha || r.fecha < fDesde)) return false;
+      if (fHasta && (!r.fecha || r.fecha > fHasta)) return false;
+      if (fProducto && r.producto !== fProducto) return false;
+      if (fDestino && r.destino !== fDestino) return false;
+      if (fRepre && r.repre !== fRepre) return false;
+      if (fOrigen && r.origen !== fOrigen) return false;
+      if (fInter && r.intermediario !== fInter) return false;
+      if (fClienteLog && r.clienteLogistica !== fClienteLog) return false;
+      if (fEstado && r.estado !== fEstado) return false;
+      if (fEnLogistica === 'si' && !r.logistica) return false;
+      if (fEnLogistica === 'no' && r.logistica) return false;
+      return true;
+    });
+  }, [registros, fDia, fDesde, fHasta, fProducto, fDestino, fRepre, fOrigen, fInter, fClienteLog, fEstado, fEnLogistica]);
+
+  const totCumplidos = filtradosBase.filter(r=>!esIncumplido(r.estado)).length;
+  const totIncumplidos = filtradosBase.length - totCumplidos;
+
+  const filtrados = useMemo(() => {
+    return filtradosBase.filter(r => {
+      if (fCumplimiento === 'cumplidos') return !esIncumplido(r.estado);
+      if (fCumplimiento === 'incumplidos') return esIncumplido(r.estado);
+      return true;
+    }).sort((a,b) => (a.fecha||'').localeCompare(b.fecha||''));
+  }, [filtradosBase, fCumplimiento]);
+
+  const limpiar = () => { setFDesde(''); setFHasta(''); setFDia(''); setFProducto(''); setFDestino(''); setFRepre(''); setFOrigen(''); setFInter(''); setFClienteLog(''); setFEstado(''); setFEnLogistica(''); setFCumplimiento(''); };
+
+  const selCls = "p-1 border border-slate-300 rounded text-[11px] outline-none focus:border-emerald-500 bg-white max-w-[130px]";
+  const dateCls = "p-1 border border-slate-300 rounded text-[11px] outline-none focus:border-emerald-500 bg-white";
+  const lbl = "text-[9px] font-bold text-slate-500 uppercase block mb-0.5";
+
+  return (
+    <div className="h-full flex flex-col gap-3">
+      {/* FILTROS */}
+      <div className="bg-white rounded-lg border border-slate-200 p-2 shrink-0">
+        <div className="flex flex-wrap gap-2 items-end">
+          <div>
+            <label className={lbl}>Día</label>
+            <input type="date" value={fDia} onChange={e=>{setFDia(e.target.value); setFDesde(''); setFHasta('');}} className={dateCls}/>
+          </div>
+          <div className="text-slate-300 pb-1 font-bold text-xs">ó</div>
+          <div>
+            <label className={lbl}>Desde</label>
+            <input type="date" value={fDesde} onChange={e=>{setFDesde(e.target.value); setFDia('');}} className={dateCls}/>
+          </div>
+          <div>
+            <label className={lbl}>Hasta</label>
+            <input type="date" value={fHasta} onChange={e=>{setFHasta(e.target.value); setFDia('');}} className={dateCls}/>
+          </div>
+          <div>
+            <label className={lbl}>Producto</label>
+            <select value={fProducto} onChange={e=>setFProducto(e.target.value)} className={selCls}><option value="">Todos</option>{productos.map(p=><option key={p} value={p}>{p}</option>)}</select>
+          </div>
+          <div>
+            <label className={lbl}>Estado</label>
+            <select value={fEstado} onChange={e=>setFEstado(e.target.value)} className={selCls}><option value="">Todos</option>{estados.map(x=><option key={x} value={x}>{x}</option>)}</select>
+          </div>
+          <div>
+            <label className={lbl}>En Logística</label>
+            <select value={fEnLogistica} onChange={e=>setFEnLogistica(e.target.value)} className={selCls}>
+              <option value="">Todos</option>
+              <option value="si">Sí · encontrado</option>
+              <option value="no">No · sin coincidencia</option>
+            </select>
+          </div>
+          <div>
+            <label className={lbl}>Repre/Com.</label>
+            <select value={fRepre} onChange={e=>setFRepre(e.target.value)} className={selCls}><option value="">Todos</option>{repres.map(r=><option key={r} value={r}>{r}</option>)}</select>
+          </div>
+          <div>
+            <label className={lbl}>Origen</label>
+            <select value={fOrigen} onChange={e=>setFOrigen(e.target.value)} className={selCls}><option value="">Todos</option>{origenes.map(o=><option key={o} value={o}>{o}</option>)}</select>
+          </div>
+          <div>
+            <label className={lbl}>Intermediario</label>
+            <select value={fInter} onChange={e=>setFInter(e.target.value)} className={selCls}><option value="">Todos</option>{intermediarios.map(x=><option key={x} value={x}>{x}</option>)}</select>
+          </div>
+          <div>
+            <label className={lbl}>Cliente Logística</label>
+            <select value={fClienteLog} onChange={e=>setFClienteLog(e.target.value)} className={selCls}><option value="">Todos</option>{clientesLog.map(x=><option key={x} value={x}>{x}</option>)}</select>
+          </div>
+          <div>
+            <label className={lbl}>Destino</label>
+            <select value={fDestino} onChange={e=>setFDestino(e.target.value)} className={selCls}><option value="">Todos</option>{destinos.map(d=><option key={d} value={d}>{d}</option>)}</select>
+          </div>
+          <button onClick={limpiar} className="text-[11px] font-bold text-slate-500 hover:text-slate-700 border border-slate-300 rounded px-2 py-1">Limpiar</button>
+        </div>
+      </div>
+
+      {/* CONTADORES */}
+      <div className="flex gap-2 shrink-0 text-xs font-bold">
+        <button onClick={()=>setFCumplimiento('')} title="Ver todos" className={`px-3 py-1 rounded transition cursor-pointer ${fCumplimiento===''?'bg-slate-700 text-white ring-2 ring-slate-300':'bg-slate-600 text-white hover:bg-slate-700'}`}>Total: {filtradosBase.length}</button>
+        <button onClick={()=>setFCumplimiento('cumplidos')} title="Filtrar solo cumplidos" className={`border px-3 py-1 rounded transition cursor-pointer ${fCumplimiento==='cumplidos'?'bg-emerald-600 text-white border-emerald-700 ring-2 ring-emerald-200':'bg-emerald-100 text-emerald-800 border-emerald-300 hover:bg-emerald-200'}`}>Cumplidos: {totCumplidos} ({pct(totCumplidos, filtradosBase.length)}%)</button>
+        <button onClick={()=>setFCumplimiento('incumplidos')} title="Filtrar solo incumplidos" className={`border px-3 py-1 rounded transition cursor-pointer ${fCumplimiento==='incumplidos'?'bg-red-600 text-white border-red-700 ring-2 ring-red-200':'bg-red-100 text-red-800 border-red-300 hover:bg-red-200'}`}>Incumplidos: {totIncumplidos} ({pct(totIncumplidos, filtradosBase.length)}%)</button>
+      </div>
+
+      {/* GRILLA */}
+      <div className="flex-1 overflow-auto custom-scroll bg-white rounded-lg border border-slate-200">
+        <table className="w-full text-left text-xs border-collapse">
+          <thead className="sticky top-0 bg-slate-100 z-10">
+            <tr>{['Fecha','Alfa','Estado','Prod.','Cli. Logística','Repre/Com.','Origen','Intermediario','Rtte. Com.','Destino','Loc. Destino','Destinatario','CTG'].map(h=>
+              <th key={h} className="p-1.5 font-bold text-slate-600 border-b border-slate-200 whitespace-nowrap">{h}</th>)}</tr>
+          </thead>
+          <tbody>
+            {filtrados.map((r,i)=>{
+              const sc = r.cruceLogistica==='sin_coincidencia';
+              const sinc = <span className="text-[10px] font-bold px-1 py-0.5 rounded bg-amber-100 text-amber-700">SIN COINC.</span>;
+              const guion = <span className="text-slate-300">—</span>;
+              return (
+              <tr key={r.id+i} className="even:bg-slate-50 hover:bg-emerald-50 transition">
+                <td className="px-1 py-1 border-b border-slate-100 whitespace-nowrap text-[11px]">{fechaDisplay(r.fecha)}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 font-bold text-slate-700 whitespace-nowrap">
+                  <span className="inline-flex items-center gap-1">
+                    <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${r.logistica ? 'bg-emerald-500' : 'bg-red-500'}`} title={r.logistica ? 'En Logística' : 'No en Logística'}></span>
+                    <span>{r.id}</span>
+                  </span>
+                </td>
+                <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap"><span className={`px-1 py-0.5 rounded text-[10px] font-bold ${esIncumplido(r.estado)?'bg-red-100 text-red-700':'bg-emerald-100 text-emerald-700'}`}>{r.estado}</span></td>
+                <td className="px-1.5 py-1 border-b border-slate-100 font-bold text-emerald-700">{r.producto}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.clienteLogistica}>{r.clienteLogistica || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap">{sc ? sinc : (r.repre ? <span className="font-bold text-indigo-700">{r.repre}</span> : guion)}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.origen}>{sc ? sinc : r.origen}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.intermediario}>{sc ? sinc : (r.intermediario || guion)}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.rtteComercial}>{sc ? sinc : (r.rtteComercial || guion)}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.destino}>{r.destino || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[180px] truncate" title={r.localidadDestino}>{r.localidadDestino || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.comprador}>{r.comprador || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100">{r.ctg}</td>
+              </tr>
+              );
+            })}
+            {filtrados.length===0 && <tr><td colSpan="13" className="p-8 text-center text-slate-400 italic">No hay turnos que coincidan con los filtros.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ==================== TAB SEMANAL ====================
+function SemanalTab({ registros }) {
+  const [fProducto, setFProducto] = useState('');
+  const [fRepre, setFRepre] = useState('');
+  const [lunesRef, setLunesRef] = useState(() => getLunes(new Date()));
+
+  const productos = useMemo(() => [...new Set(registros.map(r=>r.producto).filter(Boolean))].sort(), [registros]);
+  const repres = useMemo(() => [...new Set(registros.map(r=>r.repre).filter(Boolean))].sort(), [registros]);
+
+  // Registros filtrados por producto y repre
+  const regs = useMemo(() => registros.filter(r =>
+    (!fProducto || r.producto===fProducto) && (!fRepre || r.repre===fRepre)
+  ), [registros, fProducto, fRepre]);
+
+  // Los 7 días de la semana visible (ISO)
+  const diasSemana = useMemo(() => {
+    return Array.from({length:7}, (_,i) => {
+      const d = new Date(lunesRef);
+      d.setDate(d.getDate()+i);
+      return { iso: isoDeDate(d), dia: d.getDate(), mes: d.getMonth(), anio: d.getFullYear() };
+    });
+  }, [lunesRef]);
+
+  const isoSemana = useMemo(() => new Set(diasSemana.map(d=>d.iso)), [diasSemana]);
+
+  // Compradores que tienen algún turno en la semana visible
+  const compradores = useMemo(() => {
+    const set = new Set();
+    regs.forEach(r => {
+      if (!r.fecha || !isoSemana.has(r.fecha)) return;
+      set.add(r.comprador || 'SIN DESTINATARIO');
+    });
+    return [...set].sort((a,b) => {
+      if (a === 'SIN DESTINATARIO') return 1;
+      if (b === 'SIN DESTINATARIO') return -1;
+      return a.localeCompare(b);
+    });
+  }, [regs, isoSemana]);
+
+  // Matriz: comprador -> iso -> {total, cumplidos, incumplidos}
+  const matriz = useMemo(() => {
+    const m = {};
+    compradores.forEach(c => { m[c] = {}; diasSemana.forEach(d => m[c][d.iso] = {total:0,cump:0,incump:0}); });
+    regs.forEach(r => {
+      if (!r.fecha || !isoSemana.has(r.fecha)) return;
+      const comprador = r.comprador || 'SIN DESTINATARIO';
+      if (!m[comprador]) return;
+      const cell = m[comprador][r.fecha];
+      cell.total++;
+      if (esIncumplido(r.estado)) cell.incump++; else cell.cump++;
+    });
+    return m;
+  }, [regs, compradores, diasSemana, isoSemana]);
+
+  // Totales por columna (día) y fila (comprador)
+  const totalCol = (iso) => {
+    let t=0,c=0,i=0;
+    compradores.forEach(comp => { const cell=matriz[comp][iso]; t+=cell.total; c+=cell.cump; i+=cell.incump; });
+    return {total:t,cump:c,incump:i};
+  };
+  const totalFila = (comp) => {
+    let t=0,c=0,i=0;
+    diasSemana.forEach(d => { const cell=matriz[comp][d.iso]; t+=cell.total; c+=cell.cump; i+=cell.incump; });
+    return {total:t,cump:c,incump:i};
+  };
+  const totalGeneral = () => {
+    let t=0,c=0,i=0;
+    compradores.forEach(comp => diasSemana.forEach(d => { const cell=matriz[comp][d.iso]; t+=cell.total; c+=cell.cump; i+=cell.incump; }));
+    return {total:t,cump:c,incump:i};
+  };
+
+  // Título del mes/año visible (si la semana cruza dos meses, muestra ambos)
+  const tituloMes = useMemo(() => {
+    const meses = [...new Set(diasSemana.map(d=>`${MESES[d.mes]} ${d.anio}`))];
+    return meses.join(' / ');
+  }, [diasSemana]);
+
+  const irSemana = (delta) => {
+    const d = new Date(lunesRef);
+    d.setDate(d.getDate() + delta*7);
+    setLunesRef(getLunes(d));
+  };
+  const hoy = () => setLunesRef(getLunes(new Date()));
+
+  const Celda = ({data}) => {
+    if (!data || data.total===0) return <div className="text-slate-300 text-center">-</div>;
+    return (
+      <div className="flex items-center justify-center whitespace-nowrap leading-none text-xs">
+        <span className="font-black text-slate-800">{data.total}</span>
+        <span className="text-slate-400 mx-1">/</span>
+        <span className="font-bold text-red-600">{data.incump}</span>
+        <span className="text-[10px] font-medium text-red-500 ml-1">{((data.incump / data.total) * 100).toLocaleString('es-AR', {minimumFractionDigits:1, maximumFractionDigits:1})}%</span>
+      </div>
+    );
+  };
+
+  return (
+    <div className="h-full flex flex-col gap-3">
+      {/* CONTROLES */}
+      <div className="bg-white rounded-lg border border-slate-200 p-3 shrink-0 flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-2">
+          <button onClick={()=>irSemana(-1)} className="p-1.5 rounded-lg border border-slate-300 hover:bg-slate-100 transition"><IconLeft className="w-4 h-4"/></button>
+          <div className="text-center min-w-[180px]">
+            <div className="text-xs font-bold text-slate-400 uppercase">{tituloMes}</div>
+            <div className="text-sm font-black text-slate-700">{fechaDisplay(diasSemana[0].iso)} — {fechaDisplay(diasSemana[6].iso)}</div>
+          </div>
+          <button onClick={()=>irSemana(1)} className="p-1.5 rounded-lg border border-slate-300 hover:bg-slate-100 transition"><IconRight className="w-4 h-4"/></button>
+          <button onClick={hoy} className="text-xs font-bold text-emerald-700 border border-emerald-300 rounded px-3 py-1.5 hover:bg-emerald-50 ml-2">Hoy</button>
+        </div>
+        <div className="flex items-center gap-3">
+          <div>
+            <label className="text-[10px] font-bold text-slate-500 uppercase mr-2">Producto</label>
+            <select value={fProducto} onChange={e=>setFProducto(e.target.value)} className="p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-emerald-500 bg-white"><option value="">Todos</option>{productos.map(p=><option key={p} value={p}>{p}</option>)}</select>
+          </div>
+          <div>
+            <label className="text-[10px] font-bold text-slate-500 uppercase mr-2">Repre/Comercial</label>
+            <select value={fRepre} onChange={e=>setFRepre(e.target.value)} className="p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-emerald-500 bg-white"><option value="">Todos</option>{repres.map(r=><option key={r} value={r}>{r}</option>)}</select>
+          </div>
+        </div>
+      </div>
+
+      {/* GRILLA SEMANAL */}
+      <div className="flex-1 overflow-auto custom-scroll bg-white rounded-lg border border-slate-200">
+        <table className="w-full border-collapse text-xs">
+          <thead className="sticky top-0 z-10">
+            <tr className="bg-slate-700 text-white">
+              <th className="p-2 text-left font-bold sticky left-0 bg-slate-700 z-20 min-w-[150px]">Comprador</th>
+              {diasSemana.map((d,i)=>(
+                <th key={d.iso} className="p-2 text-center font-bold border-l border-slate-600 min-w-[72px]">
+                  <div>{DIAS_SEMANA[i]}</div>
+                  <div className="text-[11px] text-slate-300 font-black">{d.dia}</div>
+                </th>
+              ))}
+              <th className="p-2 text-center font-bold border-l-2 border-slate-500 bg-slate-800 min-w-[72px]">TOTAL</th>
+            </tr>
+          </thead>
+          <tbody>
+            {compradores.map(comp => {
+              const tf = totalFila(comp);
+              return (
+                <tr key={comp} className="hover:bg-emerald-50/40 transition">
+                  <td className="p-2 font-bold text-slate-700 border-b border-slate-100 sticky left-0 bg-white z-10 max-w-[170px] truncate" title={comp}>{comp}</td>
+                  {diasSemana.map(d => (
+                    <td key={d.iso} className="p-1.5 border-b border-l border-slate-100 align-middle"><Celda data={matriz[comp][d.iso]}/></td>
+                  ))}
+                  <td className="p-1.5 border-b border-l-2 border-slate-300 bg-slate-50 align-middle"><Celda data={tf}/></td>
+                </tr>
+              );
+            })}
+            {compradores.length===0 && <tr><td colSpan="9" className="p-8 text-center text-slate-400 italic">No hay turnos en esta semana{fProducto?` para ${fProducto}`:''}.</td></tr>}
+          </tbody>
+          {compradores.length>0 && (
+            <tfoot className="sticky bottom-0 z-10">
+              <tr className="bg-slate-200 font-bold">
+                <td className="p-2 text-slate-800 sticky left-0 bg-slate-200 z-10">TOTAL</td>
+                {diasSemana.map(d => (
+                  <td key={d.iso} className="p-1.5 border-l border-slate-300 align-middle"><Celda data={totalCol(d.iso)}/></td>
+                ))}
+                <td className="p-1.5 border-l-2 border-slate-400 bg-slate-300 align-middle"><Celda data={totalGeneral()}/></td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ==================== TAB SEMANAL REPRE / COMERCIAL ====================
+function SemanalRepreTab({ registros }) {
+  const [fProducto, setFProducto] = useState('');
+  const [fComprador, setFComprador] = useState('');
+  const [lunesRef, setLunesRef] = useState(() => getLunes(new Date()));
+
+  const productos = useMemo(() => [...new Set(registros.map(r=>r.producto).filter(Boolean))].sort(), [registros]);
+  const compradoresFiltro = useMemo(() => [...new Set(registros.map(r=>r.comprador).filter(Boolean))].sort(), [registros]);
+
+  const regs = useMemo(() => registros.filter(r =>
+    (!fProducto || r.producto===fProducto) && (!fComprador || r.comprador===fComprador)
+  ), [registros, fProducto, fComprador]);
+
+  const diasSemana = useMemo(() => Array.from({length:7}, (_,i) => {
+    const d = new Date(lunesRef); d.setDate(d.getDate()+i);
+    return { iso: isoDeDate(d), dia:d.getDate(), mes:d.getMonth(), anio:d.getFullYear() };
+  }), [lunesRef]);
+  const isoSemana = useMemo(() => new Set(diasSemana.map(d=>d.iso)), [diasSemana]);
+
+  const repres = useMemo(() => {
+    const set = new Set();
+    regs.forEach(r => {
+      if (!r.fecha || !isoSemana.has(r.fecha)) return;
+      set.add(r.repre || 'SIN COINCIDENCIA');
+    });
+    return [...set].sort((a,b) => {
+      if (a === 'SIN COINCIDENCIA') return 1;
+      if (b === 'SIN COINCIDENCIA') return -1;
+      return a.localeCompare(b);
+    });
+  }, [regs, isoSemana]);
+
+  const matriz = useMemo(() => {
+    const m = {};
+    repres.forEach(rep => { m[rep]={}; diasSemana.forEach(d=>m[rep][d.iso]={total:0,cump:0,incump:0}); });
+    regs.forEach(r => {
+      if (!r.fecha || !isoSemana.has(r.fecha)) return;
+      const rep = r.repre || 'SIN COINCIDENCIA';
+      if (!m[rep]) return;
+      const cell=m[rep][r.fecha]; cell.total++;
+      if (esIncumplido(r.estado)) cell.incump++; else cell.cump++;
+    });
+    return m;
+  }, [regs, repres, diasSemana, isoSemana]);
+
+  const totalFila = rep => { let t=0,c=0,i=0; diasSemana.forEach(d=>{const x=matriz[rep][d.iso];t+=x.total;c+=x.cump;i+=x.incump;}); return {total:t,cump:c,incump:i}; };
+  const tituloMes = useMemo(() => [...new Set(diasSemana.map(d=>`${MESES[d.mes]} ${d.anio}`))].join(' / '), [diasSemana]);
+  const irSemana = delta => { const d=new Date(lunesRef); d.setDate(d.getDate()+delta*7); setLunesRef(getLunes(d)); };
+  const hoy = () => setLunesRef(getLunes(new Date()));
+  const Celda = ({data}) => !data || data.total===0 ? <div className="text-slate-300 text-center">-</div> : (
+    <div className="flex items-center justify-center whitespace-nowrap leading-none text-xs">
+      <span className="font-black text-slate-800">{data.total}</span>
+      <span className="text-slate-400 mx-1">/</span>
+      <span className="font-bold text-red-600">{data.incump}</span>
+        <span className="text-[10px] font-medium text-red-500 ml-1">{((data.incump / data.total) * 100).toLocaleString('es-AR', {minimumFractionDigits:1, maximumFractionDigits:1})}%</span>
+    </div>
+  );
+
+  return (
+    <div className="h-full flex flex-col gap-3">
+      <div className="bg-white rounded-lg border border-slate-200 p-3 shrink-0 flex items-center justify-between flex-wrap gap-3">
+        <div className="flex items-center gap-2">
+          <button onClick={()=>irSemana(-1)} className="p-1.5 rounded-lg border border-slate-300 hover:bg-slate-100 transition"><IconLeft className="w-4 h-4"/></button>
+          <div className="text-center min-w-[180px]"><div className="text-xs font-bold text-slate-400 uppercase">{tituloMes}</div><div className="text-sm font-black text-slate-700">{fechaDisplay(diasSemana[0].iso)} — {fechaDisplay(diasSemana[6].iso)}</div></div>
+          <button onClick={()=>irSemana(1)} className="p-1.5 rounded-lg border border-slate-300 hover:bg-slate-100 transition"><IconRight className="w-4 h-4"/></button>
+          <button onClick={hoy} className="text-xs font-bold text-emerald-700 border border-emerald-300 rounded px-3 py-1.5 hover:bg-emerald-50 ml-2">Hoy</button>
+        </div>
+        <div className="flex items-center gap-3">
+          <div><label className="text-[10px] font-bold text-slate-500 uppercase mr-2">Producto</label><select value={fProducto} onChange={e=>setFProducto(e.target.value)} className="p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-emerald-500 bg-white"><option value="">Todos</option>{productos.map(p=><option key={p} value={p}>{p}</option>)}</select></div>
+          <div><label className="text-[10px] font-bold text-slate-500 uppercase mr-2">Comprador</label><select value={fComprador} onChange={e=>setFComprador(e.target.value)} className="p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-emerald-500 bg-white"><option value="">Todos</option>{compradoresFiltro.map(x=><option key={x} value={x}>{x}</option>)}</select></div>
+        </div>
+      </div>
+      <div className="flex-1 overflow-auto custom-scroll bg-white rounded-lg border border-slate-200">
+        <table className="w-full border-collapse text-xs">
+          <thead className="sticky top-0 z-10"><tr className="bg-slate-700 text-white">
+            <th className="p-2 text-left font-bold sticky left-0 bg-slate-700 z-20 min-w-[150px]">Repre/Comercial</th>
+            {diasSemana.map((d,i)=><th key={d.iso} className="p-2 text-center font-bold border-l border-slate-600 min-w-[72px]"><div>{DIAS_SEMANA[i]}</div><div className="text-[11px] text-slate-300 font-black">{d.dia}</div></th>)}
+            <th className="p-2 text-center font-bold border-l-2 border-slate-500 bg-slate-800 min-w-[72px]">TOTAL</th>
+          </tr></thead>
+          <tbody>
+            {repres.map(rep=><tr key={rep} className="hover:bg-emerald-50/40 transition">
+              <td className="p-2 font-bold text-slate-700 border-b border-slate-100 sticky left-0 bg-white z-10 max-w-[170px] truncate" title={rep}>{rep}</td>
+              {diasSemana.map(d=><td key={d.iso} className="p-1 border-b border-l border-slate-100 align-middle"><Celda data={matriz[rep][d.iso]}/></td>)}
+              <td className="p-1 border-b border-l-2 border-slate-300 bg-slate-50 align-middle"><Celda data={totalFila(rep)}/></td>
+            </tr>)}
+            {repres.length===0 && <tr><td colSpan="9" className="p-8 text-center text-slate-400 italic">No hay turnos en esta semana.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
