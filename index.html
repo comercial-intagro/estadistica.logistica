@@ -263,7 +263,8 @@ const turnoToRow = (r) => ({
   intermediario_cuit: r.intermediarioCuit || '',
   rtte_comercial: r.rtteComercial || '',
   rtte_comercial_cuit: r.rtteComercialCuit || '',
-  contrato: r.contrato || ''
+  contrato: r.contrato || '',
+  activo_en_stop: true
 });
 
 // Mapea una fila de Supabase al shape interno de la app.
@@ -282,7 +283,9 @@ const rowToTurno = (r) => ({
   intermediarioCuit: r.intermediario_cuit || '',
   rtteComercial: r.rtte_comercial || '',
   rtteComercialCuit: r.rtte_comercial_cuit || '',
-  contrato: r.contrato || ''
+  contrato: r.contrato || '',
+  activoEnStop: r.activo_en_stop !== false,
+  fuente: 'stop'
 });
 
 // Lee TODOS los turnos con paginación.
@@ -300,9 +303,45 @@ async function cargarTurnosSupabase() {
   return todos;
 }
 
-// Upsert en lotes de 50 con pausa entre cada uno para no saturar la conexión.
+// Upsert en lotes de 50 con pausa entre cada uno.
+// ANTES del upsert, marca como inactivos los turnos del rango de fechas
+// que ya no aparecen en el nuevo Excel (punto violeta).
 async function upsertTurnosSupabase(registros, onProgreso) {
   const rows = registros.map(turnoToRow);
+  const ids = new Set(rows.map(r => r.id_turno_terminal));
+
+  // Determinar rango de fechas del import
+  const fechas = rows.map(r => r.fecha).filter(Boolean).sort();
+  const minFecha = fechas[0], maxFecha = fechas[fechas.length - 1];
+
+  if (minFecha && maxFecha) {
+    // Leer los alfanuméricos existentes en ese rango
+    const pageSize = 1000;
+    let desde = 0, existentes = [];
+    for (;;) {
+      const { data, error } = await sb.from('turnos_stop')
+        .select('id_turno_terminal')
+        .gte('fecha', minFecha).lte('fecha', maxFecha)
+        .range(desde, desde + pageSize - 1);
+      if (error) throw error;
+      existentes = existentes.concat(data || []);
+      if (!data || data.length < pageSize) break;
+      desde += pageSize;
+    }
+    // Los que están en el rango pero NO vienen en el nuevo Excel → inactivos
+    const aDesactivar = existentes
+      .map(r => r.id_turno_terminal)
+      .filter(id => !ids.has(id));
+    for (let i = 0; i < aDesactivar.length; i += 200) {
+      const lote = aDesactivar.slice(i, i + 200);
+      const { error } = await sb.from('turnos_stop')
+        .update({ activo_en_stop: false })
+        .in('id_turno_terminal', lote);
+      if (error) throw error;
+    }
+  }
+
+  // Upsert los nuevos (todos con activo_en_stop = true)
   const batchSize = 50;
   let enviados = 0;
   for (let i = 0; i < rows.length; i += batchSize) {
@@ -312,8 +351,7 @@ async function upsertTurnosSupabase(registros, onProgreso) {
     if (error) throw error;
     enviados += lote.length;
     if (onProgreso) onProgreso(enviados, rows.length);
-    // Pausa de 150ms entre lotes para evitar "Failed to fetch"
-    if (i + batchSize < rows.length) await new Promise(r => setTimeout(r, 150));
+    if (i + batchSize < rows.length) await new Promise(r => setTimeout(r, 300));
   }
 }
 
@@ -520,33 +558,63 @@ function App() {
     return m;
   }, [logistica]);
 
-  const registros = useMemo(() => Object.values(data).map(r => {
-    // Para turnos normales, buscamos el Repre/Comercial en el ABM por todas las partes del turno.
-    // Prioridad: Rtte. Comercial -> Intermediario -> Origen.
-    const cuitRtte = normCuit(r.rtteComercialCuit);
-    const cuitInter = normCuit(r.intermediarioCuit);
-    const cuitOrigen = normCuit(r.origenCuit);
-    const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
-    // Validamos TODOS los alfanuméricos contra Logística.
-    const logEncontrado = mapaLogistica[normClave(r.id)] || null;
-    // Para SIN CTG usamos Logística como fuente principal.
-    // Para turnos normales, primero intentamos resolver por ABM; si no hay vendedor en ABM
-    // pero el alfa existe en Logística, usamos el Repre/Comercial informado allí.
-    const log = esIncumplido(r.estado) ? logEncontrado : null;
-    const repreLogisticaOriginal = logEncontrado ? (logEncontrado.repreCom || '') : '';
-    const repreLogisticaCanonico = repreLogisticaOriginal ? resolverRepreABM(repreLogisticaOriginal, nombresRepreAbm) : '';
-    const repreFinal = esIncumplido(r.estado)
-      ? (repreLogisticaCanonico || '')
-      : (repreAbm || repreLogisticaCanonico || '');
-    return {
-      ...r,
-      logistica: logEncontrado,
-      clienteLogistica: log ? (log.cliente || '') : '',
-      repreLogistica: repreLogisticaCanonico,
-      repre: repreFinal,
-      cruceLogistica: log ? 'encontrado' : (esIncumplido(r.estado) ? 'sin_coincidencia' : '')
-    };
-  }), [data, mapaRepre, mapaLogistica, nombresRepreAbm]);
+  const registros = useMemo(() => {
+    // 1) Turnos de STOP enriquecidos
+    const stopEnriquecidos = Object.values(data).map(r => {
+      const cuitRtte = normCuit(r.rtteComercialCuit);
+      const cuitInter = normCuit(r.intermediarioCuit);
+      const cuitOrigen = normCuit(r.origenCuit);
+      const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
+      const logEncontrado = mapaLogistica[normClave(r.id)] || null;
+      const log = esIncumplido(r.estado) ? logEncontrado : null;
+      const repreLogisticaOriginal = logEncontrado ? (logEncontrado.repreCom || '') : '';
+      const repreLogisticaCanonico = repreLogisticaOriginal ? resolverRepreABM(repreLogisticaOriginal, nombresRepreAbm) : '';
+      const repreFinal = esIncumplido(r.estado)
+        ? (repreLogisticaCanonico || '')
+        : (repreAbm || repreLogisticaCanonico || '');
+      // Semáforo de punto:
+      // verde = activo en STOP + en Logística
+      // rojo = activo en STOP + NO en Logística
+      // violeta = inactivo en STOP (removido) + en Logística
+      // gris = inactivo en STOP + NO en Logística
+      let semaforo;
+      if (r.activoEnStop !== false) {
+        semaforo = logEncontrado ? 'verde' : 'rojo';
+      } else {
+        semaforo = logEncontrado ? 'violeta' : 'gris';
+      }
+      return {
+        ...r,
+        logistica: logEncontrado,
+        clienteLogistica: log ? (log.cliente || '') : '',
+        repreLogistica: repreLogisticaCanonico,
+        repre: repreFinal,
+        cruceLogistica: log ? 'encontrado' : (esIncumplido(r.estado) ? 'sin_coincidencia' : ''),
+        semaforo,
+        fuente: 'stop'
+      };
+    });
+
+    // 2) Registros de Logística que NO están en STOP → punto negro
+    const idsStop = new Set(Object.keys(data).map(id => normClave(id)));
+    const soloLogistica = logistica
+      .filter(l => { const k = normClave(l.alfanumerico || l.stop || l.codigo || ''); return k && !idsStop.has(k); })
+      .map(l => ({
+        id: l.alfanumerico || l.stop || l.codigo || '',
+        estado: '', fecha: '', producto: '', destino: '', localidadDestino: '',
+        comprador: '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
+        contrato: '', activoEnStop: null,
+        logistica: l,
+        clienteLogistica: l.cliente || '',
+        repreLogistica: l.repreCom || '',
+        repre: resolverRepreABM(l.repreCom || '', nombresRepreAbm),
+        cruceLogistica: 'solo_logistica',
+        semaforo: 'negro',
+        fuente: 'logistica'
+      }));
+
+    return [...stopEnriquecidos, ...soloLogistica];
+  }, [data, mapaRepre, mapaLogistica, nombresRepreAbm, logistica]);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -790,6 +858,13 @@ function DetalleTab({ registros }) {
   const [fEstado, setFEstado] = useState('');
   const [fEnLogistica, setFEnLogistica] = useState('');
   const [fCumplimiento, setFCumplimiento] = useState('');
+  const [sortCol, setSortCol] = useState('fecha');
+  const [sortDir, setSortDir] = useState('asc'); // 'asc' o 'desc'
+
+  const toggleSort = (col) => {
+    if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    else { setSortCol(col); setSortDir('asc'); }
+  };
 
   const productos = useMemo(() => [...new Set(registros.map(r=>r.producto).filter(Boolean))].sort(), [registros]);
   const destinos = useMemo(() => [...new Set(registros.map(r=>r.destino).filter(Boolean))].sort(), [registros]);
@@ -821,12 +896,25 @@ function DetalleTab({ registros }) {
   const totIncumplidos = filtradosBase.length - totCumplidos;
 
   const filtrados = useMemo(() => {
-    return filtradosBase.filter(r => {
+    const base = filtradosBase.filter(r => {
       if (fCumplimiento === 'cumplidos') return !esIncumplido(r.estado);
       if (fCumplimiento === 'incumplidos') return esIncumplido(r.estado);
       return true;
-    }).sort((a,b) => (a.fecha||'').localeCompare(b.fecha||''));
-  }, [filtradosBase, fCumplimiento]);
+    });
+    const colMap = {
+      fecha:'fecha', alfa:'id', estado:'estado', prod:'producto',
+      cli:'clienteLogistica', repre:'repre', origen:'origen',
+      inter:'intermediario', rtte:'rtteComercial', destino:'destino',
+      loc:'localidadDestino', destinatario:'comprador', ctg:'ctg'
+    };
+    const key = colMap[sortCol] || 'fecha';
+    const dir = sortDir === 'desc' ? -1 : 1;
+    return base.sort((a,b) => {
+      const va = (a[key]||'').toString().toLowerCase();
+      const vb = (b[key]||'').toString().toLowerCase();
+      return va < vb ? -dir : va > vb ? dir : 0;
+    });
+  }, [filtradosBase, fCumplimiento, sortCol, sortDir]);
 
   const limpiar = () => { setFDesde(''); setFHasta(''); setFDia(''); setFProducto(''); setFDestino(''); setFRepre(''); setFOrigen(''); setFInter(''); setFClienteLog(''); setFEstado(''); setFEnLogistica(''); setFCumplimiento(''); };
 
@@ -903,8 +991,11 @@ function DetalleTab({ registros }) {
       <div className="flex-1 overflow-auto custom-scroll bg-white rounded-lg border border-slate-200">
         <table className="w-full text-left text-xs border-collapse">
           <thead className="sticky top-0 bg-slate-100 z-10">
-            <tr>{['Fecha','Alfa','Estado','Prod.','Cli. Logística','Repre/Com.','Origen','Intermediario','Rtte. Com.','Destino','Loc. Destino','Destinatario','CTG'].map(h=>
-              <th key={h} className="p-1.5 font-bold text-slate-600 border-b border-slate-200 whitespace-nowrap">{h}</th>)}</tr>
+            <tr>
+              {[['Fecha','fecha'],['Alfa','alfa'],['Estado','estado'],['Prod.','prod'],['Cli. Logística','cli'],['Repre/Com.','repre'],['Origen','origen'],['Intermediario','inter'],['Rtte. Com.','rtte'],['Destino','destino'],['Loc. Destino','loc'],['Destinatario','destinatario'],['CTG','ctg']].map(([label,col])=>
+              <th key={col} onClick={()=>toggleSort(col)} className="p-1.5 font-bold text-slate-600 border-b border-slate-200 whitespace-nowrap cursor-pointer hover:bg-slate-200 select-none">
+                {label} {sortCol===col ? (sortDir==='asc'?'▲':'▼') : <span className="text-slate-300">⇅</span>}
+              </th>)}</tr>
           </thead>
           <tbody>
             {filtrados.map((r,i)=>{
@@ -916,7 +1007,17 @@ function DetalleTab({ registros }) {
                 <td className="px-1 py-1 border-b border-slate-100 whitespace-nowrap text-[11px]">{fechaDisplay(r.fecha)}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100 font-bold text-slate-700 whitespace-nowrap">
                   <span className="inline-flex items-center gap-1">
-                    <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${r.logistica ? 'bg-emerald-500' : 'bg-red-500'}`} title={r.logistica ? 'En Logística' : 'No en Logística'}></span>
+                    <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${
+                      r.semaforo==='verde'?'bg-emerald-500':
+                      r.semaforo==='rojo'?'bg-red-500':
+                      r.semaforo==='violeta'?'bg-purple-500':
+                      r.semaforo==='negro'?'bg-slate-900':
+                      'bg-slate-400'}`} title={
+                      r.semaforo==='verde'?'En STOP y en Logística':
+                      r.semaforo==='rojo'?'En STOP, NO en Logística':
+                      r.semaforo==='violeta'?'Removido de STOP, sigue en Logística':
+                      r.semaforo==='negro'?'Solo en Logística, nunca en STOP':
+                      'Removido de STOP, no en Logística'}></span>
                     <span>{r.id}</span>
                   </span>
                 </td>
