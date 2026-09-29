@@ -876,7 +876,13 @@ function DetalleTab({ registros }) {
   const [fInter, setFInter] = useState('');
   const [fClienteLog, setFClienteLog] = useState('');
   const [fEstado, setFEstado] = useState('');
-  const [fEnLogistica, setFEnLogistica] = useState('');
+  const [fSemaforo, setFSemaforo] = useState(new Set(['verde','rojo','violeta','negro','gris']));
+  const [showSemaforoMenu, setShowSemaforoMenu] = useState(false);
+  const toggleSemaforo = (color) => setFSemaforo(prev => {
+    const next = new Set(prev);
+    next.has(color) ? next.delete(color) : next.add(color);
+    return next;
+  });
   const [fCumplimiento, setFCumplimiento] = useState('');
   const [sortCol, setSortCol] = useState('fecha');
   const [sortDir, setSortDir] = useState('asc'); // 'asc' o 'desc'
@@ -906,11 +912,10 @@ function DetalleTab({ registros }) {
       if (fInter && r.intermediario !== fInter) return false;
       if (fClienteLog && r.clienteLogistica !== fClienteLog) return false;
       if (fEstado && r.estado !== fEstado) return false;
-      if (fEnLogistica === 'si' && !r.logistica) return false;
-      if (fEnLogistica === 'no' && r.logistica) return false;
+      if (!fSemaforo.has(r.semaforo)) return false;
       return true;
     });
-  }, [registros, fDia, fDesde, fHasta, fProducto, fDestino, fRepre, fOrigen, fInter, fClienteLog, fEstado, fEnLogistica]);
+  }, [registros, fDia, fDesde, fHasta, fProducto, fDestino, fRepre, fOrigen, fInter, fClienteLog, fEstado, fSemaforo]);
 
   const totCumplidos = filtradosBase.filter(r=>!esIncumplido(r.estado)).length;
   const totIncumplidos = filtradosBase.length - totCumplidos;
@@ -936,7 +941,7 @@ function DetalleTab({ registros }) {
     });
   }, [filtradosBase, fCumplimiento, sortCol, sortDir]);
 
-  const limpiar = () => { setFDesde(''); setFHasta(''); setFDia(''); setFProducto(''); setFDestino(''); setFRepre(''); setFOrigen(''); setFInter(''); setFClienteLog(''); setFEstado(''); setFEnLogistica(''); setFCumplimiento(''); };
+  const limpiar = () => { setFDesde(''); setFHasta(''); setFDia(''); setFProducto(''); setFDestino(''); setFRepre(''); setFOrigen(''); setFInter(''); setFClienteLog(''); setFEstado(''); setFSemaforo(new Set(['verde','rojo','violeta','negro','gris'])); setShowSemaforoMenu(false); setFCumplimiento(''); };
 
   const selCls = "p-1 border border-slate-300 rounded text-[11px] outline-none focus:border-emerald-500 bg-white max-w-[130px]";
   const dateCls = "p-1 border border-slate-300 rounded text-[11px] outline-none focus:border-emerald-500 bg-white";
@@ -968,13 +973,33 @@ function DetalleTab({ registros }) {
             <label className={lbl}>Estado</label>
             <select value={fEstado} onChange={e=>setFEstado(e.target.value)} className={selCls}><option value="">Todos</option>{estados.map(x=><option key={x} value={x}>{x}</option>)}</select>
           </div>
-          <div>
-            <label className={lbl}>En Logística</label>
-            <select value={fEnLogistica} onChange={e=>setFEnLogistica(e.target.value)} className={selCls}>
-              <option value="">Todos</option>
-              <option value="si">Sí · encontrado</option>
-              <option value="no">No · sin coincidencia</option>
-            </select>
+          <div className="relative">
+            <label className={lbl}>Estado cruce</label>
+            <button onClick={()=>setShowSemaforoMenu(p=>!p)} className={selCls + " flex items-center gap-1 cursor-pointer text-left"}>
+              {fSemaforo.size===5 ? 'Todos' : fSemaforo.size===0 ? 'Ninguno' : [...fSemaforo].map(c=>({verde:'🟢',rojo:'🔴',violeta:'🟣',negro:'⚫',gris:'⚪'}[c])).join('')}
+            </button>
+            {showSemaforoMenu && (
+              <><div className="fixed inset-0 z-40" onClick={()=>setShowSemaforoMenu(false)}></div>
+              <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-xl z-50 min-w-[220px] py-1" onClick={e=>e.stopPropagation()}>
+                {[
+                  ['verde','bg-emerald-500','En STOP y en Logística'],
+                  ['rojo','bg-red-500','En STOP, no en Logística'],
+                  ['violeta','bg-purple-500','Removido de STOP'],
+                  ['negro','bg-slate-900','Solo en Logística'],
+                  ['gris','bg-slate-400','Removido, no en Logística']
+                ].map(([color, bg, desc])=>(
+                  <div key={color} className="flex items-center justify-between px-3 py-2 hover:bg-slate-50 cursor-pointer" onClick={()=>toggleSemaforo(color)}>
+                    <div className="flex items-center gap-2">
+                      <span className={`inline-block w-2.5 h-2.5 rounded-full ${bg}`}></span>
+                      <span className="text-xs text-slate-700">{desc}</span>
+                    </div>
+                    <div className={`w-8 h-[18px] rounded-full transition-colors relative ${fSemaforo.has(color)?'bg-emerald-600':'bg-slate-300'}`}>
+                      <div className={`absolute top-[2px] w-[14px] h-[14px] bg-white rounded-full shadow transition-transform ${fSemaforo.has(color)?'translate-x-[16px]':'translate-x-[2px]'}`}></div>
+                    </div>
+                  </div>
+                ))}
+              </div></>
+            )}
           </div>
           <div>
             <label className={lbl}>Repre/Com.</label>
