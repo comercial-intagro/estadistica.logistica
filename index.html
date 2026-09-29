@@ -596,22 +596,42 @@ function App() {
     });
 
     // 2) Registros de Logística que NO están en STOP → punto negro
+    // Solo mostramos los que tengan fecha >= CUTOFF_NEGRO (inicio del seguimiento STOP).
+    const CUTOFF_NEGRO = '2026-09-14';
     const idsStop = new Set(Object.keys(data).map(id => normClave(id)));
     const soloLogistica = logistica
-      .filter(l => { const k = normClave(l.alfanumerico || l.stop || l.codigo || ''); return k && !idsStop.has(k); })
-      .map(l => ({
-        id: l.alfanumerico || l.stop || l.codigo || '',
-        estado: '', fecha: '', producto: '', destino: '', localidadDestino: '',
-        comprador: '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
-        contrato: '', activoEnStop: null,
-        logistica: l,
-        clienteLogistica: l.cliente || '',
-        repreLogistica: l.repreCom || '',
-        repre: resolverRepreABM(l.repreCom || '', nombresRepreAbm),
-        cruceLogistica: 'solo_logistica',
-        semaforo: 'negro',
-        fuente: 'logistica'
-      }));
+      .filter(l => {
+        const k = normClave(l.alfanumerico || l.stop || l.codigo || '');
+        if (!k || idsStop.has(k)) return false;
+        // Intentar extraer fecha del alfanumérico (DDMMYYYY embebido)
+        const raw = l.alfanumerico || l.stop || l.codigo || '';
+        const m8 = raw.match(/(\d{2})(\d{2})(\d{4})/);
+        if (m8) {
+          const iso = `${m8[3]}-${m8[2]}-${m8[1]}`;
+          if (iso < CUTOFF_NEGRO || iso > '2099-12-31') return false;
+          return true;
+        }
+        // Sin fecha parseable → no mostrar como negro
+        return false;
+      })
+      .map(l => {
+        const raw = l.alfanumerico || l.stop || l.codigo || '';
+        const m8 = raw.match(/(\d{2})(\d{2})(\d{4})/);
+        const fechaExtraida = m8 ? `${m8[3]}-${m8[2]}-${m8[1]}` : '';
+        return {
+          id: raw,
+          estado: '', fecha: fechaExtraida, producto: '', destino: '', localidadDestino: '',
+          comprador: '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
+          contrato: '', activoEnStop: null,
+          logistica: l,
+          clienteLogistica: l.cliente || '',
+          repreLogistica: l.repreCom || '',
+          repre: resolverRepreABM(l.repreCom || '', nombresRepreAbm),
+          cruceLogistica: 'solo_logistica',
+          semaforo: 'negro',
+          fuente: 'logistica'
+        };
+      });
 
     return [...stopEnriquecidos, ...soloLogistica];
   }, [data, mapaRepre, mapaLogistica, nombresRepreAbm, logistica]);
