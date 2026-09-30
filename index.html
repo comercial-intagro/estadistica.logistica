@@ -303,6 +303,22 @@ async function cargarTurnosSupabase() {
   return todos;
 }
 
+// Lee los cupos asignados (grilla 3 de Gestión) para cruzar por alfanumérico:
+// de ahí sale el Cliente al que se asignó cada turno.
+async function cargarAsignadosSupabase() {
+  const pageSize = 1000;
+  let desde = 0, todos = [];
+  for (;;) {
+    const { data, error } = await sb.from('assigned_quotas')
+      .select('alfanumerico,client_name').range(desde, desde + pageSize - 1);
+    if (error) throw error;
+    todos = todos.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    desde += pageSize;
+  }
+  return todos;
+}
+
 // Upsert en lotes de 50 con pausa entre cada uno.
 // ANTES del upsert, marca como inactivos los turnos del rango de fechas
 // que ya no aparecen en el nuevo Excel (punto violeta).
@@ -400,6 +416,27 @@ function App() {
     return () => { sb.removeChannel(ch); };
   }, []);
 
+  // Asignados (grilla 3 de Gestión): mapa alfanumérico -> cliente, para la columna Cliente.
+  const [asignados, setAsignados] = useState({});
+  const cargarAsignados = async () => {
+    try {
+      const rows = await cargarAsignadosSupabase();
+      const m = {};
+      rows.forEach(a => {
+        const k = normClave(a.alfanumerico);
+        if (k && a.client_name) m[k] = a.client_name;
+      });
+      setAsignados(m);
+    } catch(e) { console.error('Error cargando asignados', e); }
+  };
+  useEffect(() => {
+    cargarAsignados();
+    const ch = sb.channel('rt_assigned_cliente')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'assigned_quotas' }, () => cargarAsignados())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, []);
+
   // Clientes: se leen de Supabase (Gestión Logística) al abrir y con el botón de refresco.
   const cargarClientes = async () => {
     setClientesEstado('cargando'); setClientesError('');
@@ -427,7 +464,13 @@ function App() {
       setSupaLogEstado('error');
     }
   };
-  useEffect(() => { cargarSupaLog(); }, []);
+  useEffect(() => {
+    cargarSupaLog();
+    const ch = sb.channel('rt_disponibilidad')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'quota_alfanumericos' }, () => cargarSupaLog())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, []);
 
 
   const refrescoEnCurso = useRef(false);
@@ -479,20 +522,8 @@ function App() {
   };
 
   useEffect(() => {
-    // Mostrar inmediatamente la última copia exitosa, mientras en segundo plano buscamos cambios.
-    try {
-      const cache = JSON.parse(localStorage.getItem(STORAGE_LOGISTICA) || 'null');
-      if (cache && Array.isArray(cache.registros) && cache.registros.length) {
-        setLogistica(cache.registros);
-        setLogisticaActualizada(cache.actualizado || null);
-        setLogisticaEstado('ok');
-      }
-    } catch(e) { console.warn('Caché de Logística inválida', e); }
-
-    const inicio = setTimeout(() => refrescarLogistica(true), 250);
-    // 5 minutos reduce carga sobre Apps Script; cada ciclo ya tiene reintento automático.
-    const t = setInterval(() => refrescarLogistica(true), 300000);
-    return () => { clearTimeout(inicio); clearInterval(t); };
+    // JSONP de Logística retirado (Etapa 2): el cruce ahora es 100% contra Supabase.
+    setLogisticaEstado('ok');
   }, []);
 
   // Mapa CUIT -> repre para el cruce rápido
@@ -559,82 +590,60 @@ function App() {
   }, [logistica]);
 
   const registros = useMemo(() => {
+    const dispMap = supaLog.map || {}; // alfanuméricos que están en Disponibilidad de Cupos
+    const idsStop = new Set(Object.keys(data).map(id => normClave(id)));
+
     // 1) Turnos de STOP enriquecidos
     const stopEnriquecidos = Object.values(data).map(r => {
       const cuitRtte = normCuit(r.rtteComercialCuit);
       const cuitInter = normCuit(r.intermediarioCuit);
       const cuitOrigen = normCuit(r.origenCuit);
       const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
-      const logEncontrado = mapaLogistica[normClave(r.id)] || null;
-      const log = esIncumplido(r.estado) ? logEncontrado : null;
-      const repreLogisticaOriginal = logEncontrado ? (logEncontrado.repreCom || '') : '';
-      const repreLogisticaCanonico = repreLogisticaOriginal ? resolverRepreABM(repreLogisticaOriginal, nombresRepreAbm) : '';
-      const repreFinal = esIncumplido(r.estado)
-        ? (repreLogisticaCanonico || '')
-        : (repreAbm || repreLogisticaCanonico || '');
-      // Semáforo de punto:
-      // verde = activo en STOP + en Logística
-      // rojo = activo en STOP + NO en Logística
-      // violeta = inactivo en STOP (removido) + en Logística
-      // gris = inactivo en STOP + NO en Logística
-      let semaforo;
-      if (r.activoEnStop !== false) {
-        semaforo = logEncontrado ? 'verde' : 'rojo';
-      } else {
-        semaforo = logEncontrado ? 'violeta' : 'gris';
-      }
+      const enDisponibilidad = !!dispMap[normClave(r.id)];
+      // Semáforo:
+      // rojo = turno en STOP que NO está en Disponibilidad de Cupos (hay que cargarlo)
+      // (sin color) = turno en STOP que ya está en Disponibilidad
+      const semaforo = enDisponibilidad ? '' : 'rojo';
       return {
         ...r,
-        logistica: logEncontrado,
-        clienteLogistica: log ? (log.cliente || '') : '',
-        repreLogistica: repreLogisticaCanonico,
-        repre: repreFinal,
-        cruceLogistica: log ? 'encontrado' : (esIncumplido(r.estado) ? 'sin_coincidencia' : ''),
+        clienteAsignado: asignados[normClave(r.id)] || '',
+        enDisponibilidad,
+        repre: repreAbm,
         semaforo,
         fuente: 'stop'
       };
     });
 
-    // 2) Registros de Logística que NO están en STOP → punto negro
-    // Solo mostramos los que tengan fecha >= CUTOFF_NEGRO (inicio del seguimiento STOP).
-    const CUTOFF_NEGRO = '2026-09-14';
-    const idsStop = new Set(Object.keys(data).map(id => normClave(id)));
-    const soloLogistica = logistica
-      .filter(l => {
-        const k = normClave(l.alfanumerico || l.stop || l.codigo || '');
-        if (!k || idsStop.has(k)) return false;
-        // Intentar extraer fecha del alfanumérico (DDMMYYYY embebido)
-        const raw = l.alfanumerico || l.stop || l.codigo || '';
-        const m8 = raw.match(/(\d{2})(\d{2})(\d{4})/);
-        if (m8) {
-          const iso = `${m8[3]}-${m8[2]}-${m8[1]}`;
-          if (iso < CUTOFF_NEGRO || iso > '2099-12-31') return false;
-          return true;
-        }
-        // Sin fecha parseable → no mostrar como negro
-        return false;
-      })
-      .map(l => {
-        const raw = l.alfanumerico || l.stop || l.codigo || '';
-        const m8 = raw.match(/(\d{2})(\d{2})(\d{4})/);
-        const fechaExtraida = m8 ? `${m8[3]}-${m8[2]}-${m8[1]}` : '';
-        return {
-          id: raw,
-          estado: '', fecha: fechaExtraida, producto: '', destino: '', localidadDestino: '',
-          comprador: '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
-          contrato: '', activoEnStop: null,
-          logistica: l,
-          clienteLogistica: l.cliente || '',
-          repreLogistica: l.repreCom || '',
-          repre: resolverRepreABM(l.repreCom || '', nombresRepreAbm),
-          cruceLogistica: 'solo_logistica',
-          semaforo: 'negro',
-          fuente: 'logistica'
-        };
-      });
+    // 2) Cupos asignados (grilla 3) que NO aparecen en el STOP → punto negro
+    const soloAsignados = Object.entries(asignados)
+      .filter(([alfa]) => !idsStop.has(alfa))
+      .map(([alfa, cliente]) => ({
+        id: alfa,
+        estado: '', fecha: '', producto: '', destino: '', localidadDestino: '',
+        comprador: '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
+        contrato: '', activoEnStop: null,
+        clienteAsignado: cliente,
+        enDisponibilidad: true,
+        repre: '',
+        semaforo: 'negro',
+        fuente: 'asignado'
+      }));
 
-    return [...stopEnriquecidos, ...soloLogistica];
-  }, [data, mapaRepre, mapaLogistica, nombresRepreAbm, logistica]);
+    return [...stopEnriquecidos, ...soloAsignados];
+  }, [data, mapaRepre, asignados, supaLog]);
+
+  // Abre la carga de cupos hacia Disponibilidad con los turnos seleccionados.
+  // (El formulario portado se conecta en la próxima etapa; por ahora muestra el resumen.)
+  const abrirCargaCupos = (ids) => {
+    const sel = registros.filter(r => ids.includes(r.id));
+    if (!sel.length) return;
+    const r0 = sel[0];
+    const resumen = `Se van a cargar ${sel.length} cupo(s) a Disponibilidad:\n\n` +
+      `Producto: ${r0.producto}\nDestinatario: ${r0.comprador}\nDestino: ${r0.destino}\nFecha: ${fechaDisplay(r0.fecha)}\n\n` +
+      `Alfanuméricos:\n${sel.map(r=>r.id).join('\n')}\n\n` +
+      `(El formulario de carga se conecta en la próxima etapa, para probarlo en vivo.)`;
+    alert(resumen);
+  };
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -652,18 +661,12 @@ function App() {
             <span className={`text-[11px] font-bold px-2 py-1 rounded ${turnosEstado==='ok'?'bg-emerald-900/40 text-emerald-100':turnosEstado==='error'?'bg-red-900/50 text-red-100':'bg-amber-900/40 text-amber-100'}`}>
               {turnosEstado==='ok' ? `${registros.length} turnos` : turnosEstado==='error' ? 'Turnos ERROR' : 'Cargando turnos...'} {lastUpdate && `· ${new Date(lastUpdate).toLocaleString('es-AR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}`}
             </span>
-            <button onClick={() => refrescarLogistica(false)} className={`text-[11px] font-bold px-2 py-1 rounded border ${logisticaEstado==='ok'?'bg-emerald-900/40 border-emerald-500/40 text-emerald-100':logisticaEstado==='error'?'bg-red-900/50 border-red-400/40 text-red-100':'bg-amber-900/40 border-amber-400/40 text-amber-100'}`} title={logisticaEstado==='error'?logisticaError:'Actualizar Logística ahora'}>
-              {logisticaEstado==='ok' ? `● Logística ${logistica.length}` : logisticaEstado==='error' ? '● Logística ERROR' : '● Conectando Logística...'}
-            </button>
             <label className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition shadow-sm ${processing ? 'bg-slate-400 cursor-wait' : 'bg-white text-emerald-800 hover:bg-emerald-50'}`}>
               <IconUpload className="w-4 h-4"/>{processing ? (uploadProg || 'Procesando...') : 'Subir Excel STOP'}
               <input type="file" accept=".xlsx,.xls" onChange={handleUpload} disabled={processing} className="hidden"/>
             </label>
             <button onClick={()=>setShowAbm(true)} className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm border ${clientesEstado==='ok'?'bg-emerald-900/50 text-white hover:bg-emerald-900/70 border-emerald-600/40':clientesEstado==='error'?'bg-red-900/50 text-red-100 border-red-400/40':'bg-amber-900/40 text-amber-100 border-amber-400/40'}`} title={clientesEstado==='error'?('Clientes: '+clientesError):'Ver clientes / representantes (se editan en Gestión Logística)'}>
               <IconUsers className="w-4 h-4"/> Clientes {clientesEstado==='ok' ? clientes.length : clientesEstado==='error' ? 'ERROR' : '...'}
-            </button>
-            <button onClick={()=>setShowDiag(true)} className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm border ${supaLogEstado==='ok'?'bg-indigo-900/50 text-indigo-100 hover:bg-indigo-900/70 border-indigo-500/40':supaLogEstado==='error'?'bg-red-900/50 text-red-100 border-red-400/40':'bg-amber-900/40 text-amber-100 border-amber-400/40'}`} title="Diagnóstico: comparar cruce SIN CTG entre JSONP y Supabase">
-              Diag. {supaLogEstado==='ok' ? supaLog.totalAlfas : supaLogEstado==='error' ? 'ERROR' : '...'}
             </button>
             <button onClick={borrarTodo} className="bg-red-900/40 hover:bg-red-700 text-red-100 p-1.5 rounded-lg transition" title="Borrar todos los datos"><IconTrash className="w-4 h-4"/></button>
           </div>
@@ -690,11 +693,10 @@ function App() {
             <p className="font-bold">No hay datos cargados</p>
             <p className="text-sm">Subí un Excel del STOP para empezar.</p>
           </div>
-        ) : tab === 'detalle' ? <DetalleTab registros={registros}/> : tab === 'semanal' ? <SemanalTab registros={registros}/> : <SemanalRepreTab registros={registros}/>}
+        ) : tab === 'detalle' ? <DetalleTab registros={registros} abrirCargaCupos={abrirCargaCupos}/> : tab === 'semanal' ? <SemanalTab registros={registros}/> : <SemanalRepreTab registros={registros}/>}
       </div>
 
       {showAbm && <VisorClientes clientes={clientes} estado={clientesEstado} error={clientesError} onRefresh={cargarClientes} onClose={()=>setShowAbm(false)}/>}
-      {showDiag && <DiagLogistica registros={registros} logisticaMap={mapaLogistica} logisticaCount={logistica.length} supaLog={supaLog} estado={supaLogEstado} error={supaLogError} onRefresh={cargarSupaLog} onClose={()=>setShowDiag(false)}/>}
     </div>
   );
 }
@@ -865,7 +867,7 @@ function DiagLogistica({ registros, logisticaMap, logisticaCount, supaLog, estad
 }
 
 // ==================== TAB DETALLE ====================
-function DetalleTab({ registros }) {
+function DetalleTab({ registros, abrirCargaCupos }) {
   const [fDesde, setFDesde] = useState('');
   const [fHasta, setFHasta] = useState('');
   const [fDia, setFDia] = useState(() => isoDeDate(new Date()));
@@ -876,7 +878,7 @@ function DetalleTab({ registros }) {
   const [fInter, setFInter] = useState('');
   const [fClienteLog, setFClienteLog] = useState('');
   const [fEstado, setFEstado] = useState('');
-  const [fSemaforo, setFSemaforo] = useState(new Set(['verde','rojo','violeta','negro','gris']));
+  const [fSemaforo, setFSemaforo] = useState(new Set(['normal','rojo','negro']));
   const [showSemaforoMenu, setShowSemaforoMenu] = useState(false);
   const toggleSemaforo = (color) => setFSemaforo(prev => {
     const next = new Set(prev);
@@ -886,6 +888,23 @@ function DetalleTab({ registros }) {
   const [fCumplimiento, setFCumplimiento] = useState('');
   const [sortCol, setSortCol] = useState('fecha');
   const [sortDir, setSortDir] = useState('asc'); // 'asc' o 'desc'
+
+  // Selección de turnos con punto rojo para cargarlos a Disponibilidad de Cupos
+  const [seleccion, setSeleccion] = useState(new Set()); // set de ids seleccionados
+  // Clave de coincidencia: producto + destinatario + destino + fecha
+  const claveCoincidencia = (r) => [r.producto, r.comprador, r.destino, r.fecha].map(x => (x||'').toString().trim().toUpperCase()).join('||');
+  // Cuando hay selección, calculamos la clave de referencia (la del primer seleccionado)
+  const clavesSeleccionadas = useMemo(() => {
+    const s = new Set();
+    registros.forEach(r => { if (seleccion.has(r.id)) s.add(claveCoincidencia(r)); });
+    return s;
+  }, [seleccion, registros]);
+  const toggleSeleccion = (id) => setSeleccion(prev => {
+    const next = new Set(prev);
+    next.has(id) ? next.delete(id) : next.add(id);
+    return next;
+  });
+  const limpiarSeleccion = () => setSeleccion(new Set());
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -897,7 +916,7 @@ function DetalleTab({ registros }) {
   const repres = useMemo(() => [...new Set(registros.map(r=>r.repre).filter(Boolean))].sort(), [registros]);
   const origenes = useMemo(() => [...new Set(registros.map(r=>r.origen).filter(Boolean))].sort(), [registros]);
   const intermediarios = useMemo(() => [...new Set(registros.map(r=>r.intermediario).filter(Boolean))].sort(), [registros]);
-  const clientesLog = useMemo(() => [...new Set(registros.map(r=>r.clienteLogistica).filter(Boolean))].sort(), [registros]);
+  const clientesLog = useMemo(() => [...new Set(registros.map(r=>r.clienteAsignado).filter(Boolean))].sort(), [registros]);
   const estados = useMemo(() => [...new Set(registros.map(r=>r.estado).filter(Boolean))].sort(), [registros]);
 
   const filtradosBase = useMemo(() => {
@@ -910,9 +929,9 @@ function DetalleTab({ registros }) {
       if (fRepre && r.repre !== fRepre) return false;
       if (fOrigen && r.origen !== fOrigen) return false;
       if (fInter && r.intermediario !== fInter) return false;
-      if (fClienteLog && r.clienteLogistica !== fClienteLog) return false;
+      if (fClienteLog && r.clienteAsignado !== fClienteLog) return false;
       if (fEstado && r.estado !== fEstado) return false;
-      if (!fSemaforo.has(r.semaforo)) return false;
+      if (!fSemaforo.has(r.semaforo || 'normal')) return false;
       return true;
     });
   }, [registros, fDia, fDesde, fHasta, fProducto, fDestino, fRepre, fOrigen, fInter, fClienteLog, fEstado, fSemaforo]);
@@ -928,7 +947,7 @@ function DetalleTab({ registros }) {
     });
     const colMap = {
       fecha:'fecha', alfa:'id', estado:'estado', prod:'producto',
-      cli:'clienteLogistica', repre:'repre', origen:'origen',
+      cli:'clienteAsignado', repre:'repre', origen:'origen',
       inter:'intermediario', rtte:'rtteComercial', destino:'destino',
       loc:'localidadDestino', destinatario:'comprador', ctg:'ctg'
     };
@@ -976,17 +995,15 @@ function DetalleTab({ registros }) {
           <div className="relative">
             <label className={lbl}>Estado cruce</label>
             <button onClick={()=>setShowSemaforoMenu(p=>!p)} className={selCls + " flex items-center gap-1 cursor-pointer text-left"}>
-              {fSemaforo.size===5 ? 'Todos' : fSemaforo.size===0 ? 'Ninguno' : [...fSemaforo].map(c=>({verde:'🟢',rojo:'🔴',violeta:'🟣',negro:'⚫',gris:'⚪'}[c])).join('')}
+              {fSemaforo.size===3 ? 'Todos' : fSemaforo.size===0 ? 'Ninguno' : [...fSemaforo].map(c=>({normal:'⚪',rojo:'🔴',negro:'⚫'}[c])).join('')}
             </button>
             {showSemaforoMenu && (
               <><div className="fixed inset-0 z-40" onClick={()=>setShowSemaforoMenu(false)}></div>
-              <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-xl z-50 min-w-[220px] py-1" onClick={e=>e.stopPropagation()}>
+              <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-xl z-50 min-w-[260px] py-1" onClick={e=>e.stopPropagation()}>
                 {[
-                  ['verde','bg-emerald-500','En STOP y en Logística'],
-                  ['rojo','bg-red-500','En STOP, no en Logística'],
-                  ['violeta','bg-purple-500','Removido de STOP'],
-                  ['negro','bg-slate-900','Solo en Logística'],
-                  ['gris','bg-slate-400','Removido, no en Logística']
+                  ['normal','bg-slate-300','En STOP y en Disponibilidad'],
+                  ['rojo','bg-red-500','En STOP, falta cargar en Disponibilidad'],
+                  ['negro','bg-slate-900','Asignado que no está en el STOP']
                 ].map(([color, bg, desc])=>(
                   <div key={color} className="flex items-center justify-between px-3 py-2 hover:bg-slate-50 cursor-pointer" onClick={()=>toggleSemaforo(color)}>
                     <div className="flex items-center gap-2">
@@ -1014,7 +1031,7 @@ function DetalleTab({ registros }) {
             <select value={fInter} onChange={e=>setFInter(e.target.value)} className={selCls}><option value="">Todos</option>{intermediarios.map(x=><option key={x} value={x}>{x}</option>)}</select>
           </div>
           <div>
-            <label className={lbl}>Cliente Logística</label>
+            <label className={lbl}>Cliente</label>
             <select value={fClienteLog} onChange={e=>setFClienteLog(e.target.value)} className={selCls}><option value="">Todos</option>{clientesLog.map(x=><option key={x} value={x}>{x}</option>)}</select>
           </div>
           <div>
@@ -1032,55 +1049,74 @@ function DetalleTab({ registros }) {
         <button onClick={()=>setFCumplimiento('incumplidos')} title="Filtrar solo incumplidos" className={`border px-3 py-1 rounded transition cursor-pointer ${fCumplimiento==='incumplidos'?'bg-red-600 text-white border-red-700 ring-2 ring-red-200':'bg-red-100 text-red-800 border-red-300 hover:bg-red-200'}`}>Incumplidos: {totIncumplidos} ({pct(totIncumplidos, filtradosBase.length)}%)</button>
       </div>
 
+      {/* BARRA DE SELECCIÓN */}
+      {seleccion.size > 0 && (
+        <div className="bg-emerald-600 text-white rounded-lg px-4 py-2 shrink-0 flex items-center justify-between shadow-md">
+          <span className="text-sm font-bold flex items-center gap-2">
+            <span className="bg-white/20 px-2 py-0.5 rounded">{seleccion.size}</span>
+            turno{seleccion.size>1?'s':''} seleccionado{seleccion.size>1?'s':''} para agregar a Disponibilidad
+          </span>
+          <div className="flex items-center gap-2">
+            <button onClick={limpiarSeleccion} className="text-xs font-bold text-emerald-100 hover:text-white px-3 py-1.5">Limpiar selección</button>
+            <button onClick={()=>abrirCargaCupos([...seleccion])} className="bg-white text-emerald-700 hover:bg-emerald-50 text-sm font-bold px-4 py-1.5 rounded-lg shadow flex items-center gap-1.5">
+              <span className="text-lg leading-none">+</span> Agregar Cupos
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* GRILLA */}
       <div className="flex-1 overflow-auto custom-scroll bg-white rounded-lg border border-slate-200">
         <table className="w-full text-left text-xs border-collapse">
           <thead className="sticky top-0 bg-slate-100 z-10">
             <tr>
-              {[['Fecha','fecha'],['Alfa','alfa'],['Estado','estado'],['Prod.','prod'],['Cli. Logística','cli'],['Repre/Com.','repre'],['Origen','origen'],['Intermediario','inter'],['Rtte. Com.','rtte'],['Destino','destino'],['Loc. Destino','loc'],['Destinatario','destinatario'],['CTG','ctg']].map(([label,col])=>
+              <th className="p-1.5 border-b border-slate-200 w-8"></th>
+              {[['Fecha','fecha'],['Alfa','alfa'],['Estado','estado'],['Prod.','prod'],['Cliente','cli'],['Repre/Com.','repre'],['Origen','origen'],['Intermediario','inter'],['Rtte. Com.','rtte'],['Destinatario','destinatario'],['Destino','destino'],['Loc. Destino','loc'],['CTG','ctg']].map(([label,col])=>
               <th key={col} onClick={()=>toggleSort(col)} className="p-1.5 font-bold text-slate-600 border-b border-slate-200 whitespace-nowrap cursor-pointer hover:bg-slate-200 select-none">
                 {label} {sortCol===col ? (sortDir==='asc'?'▲':'▼') : <span className="text-slate-300">⇅</span>}
               </th>)}</tr>
           </thead>
           <tbody>
             {filtrados.map((r,i)=>{
-              const sc = r.cruceLogistica==='sin_coincidencia';
-              const sinc = <span className="text-[10px] font-bold px-1 py-0.5 rounded bg-amber-100 text-amber-700">SIN COINC.</span>;
               const guion = <span className="text-slate-300">—</span>;
+              const esRojo = r.semaforo==='rojo';
+              const seleccionado = seleccion.has(r.id);
+              // Coincide con lo ya seleccionado (mismo producto+destinatario+destino+fecha) y es rojo
+              const coincide = esRojo && !seleccionado && clavesSeleccionadas.size>0 && clavesSeleccionadas.has(claveCoincidencia(r));
+              const bgClase = seleccionado ? 'bg-emerald-200' : coincide ? 'bg-emerald-50' : 'even:bg-slate-50 hover:bg-emerald-50';
               return (
-              <tr key={r.id+i} className="even:bg-slate-50 hover:bg-emerald-50 transition">
+              <tr key={r.id+i} className={`${bgClase} transition`}>
+                <td className="px-1 py-1 border-b border-slate-100 text-center">
+                  {esRojo && <input type="checkbox" checked={seleccionado} onChange={()=>toggleSeleccion(r.id)} className="cursor-pointer" title="Seleccionar para agregar a Disponibilidad de Cupos"/>}
+                </td>
                 <td className="px-1 py-1 border-b border-slate-100 whitespace-nowrap text-[11px]">{fechaDisplay(r.fecha)}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100 font-bold text-slate-700 whitespace-nowrap">
                   <span className="inline-flex items-center gap-1">
                     <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${
-                      r.semaforo==='verde'?'bg-emerald-500':
                       r.semaforo==='rojo'?'bg-red-500':
-                      r.semaforo==='violeta'?'bg-purple-500':
                       r.semaforo==='negro'?'bg-slate-900':
-                      'bg-slate-400'}`} title={
-                      r.semaforo==='verde'?'En STOP y en Logística':
-                      r.semaforo==='rojo'?'En STOP, NO en Logística':
-                      r.semaforo==='violeta'?'Removido de STOP, sigue en Logística':
-                      r.semaforo==='negro'?'Solo en Logística, nunca en STOP':
-                      'Removido de STOP, no en Logística'}></span>
+                      'bg-transparent'}`} title={
+                      r.semaforo==='rojo'?'En STOP, NO está en Disponibilidad de Cupos':
+                      r.semaforo==='negro'?'Cupo asignado que NO aparece en el STOP':
+                      'En STOP y en Disponibilidad'}></span>
                     <span>{r.id}</span>
                   </span>
                 </td>
                 <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap"><span className={`px-1 py-0.5 rounded text-[10px] font-bold ${esIncumplido(r.estado)?'bg-red-100 text-red-700':'bg-emerald-100 text-emerald-700'}`}>{r.estado}</span></td>
                 <td className="px-1.5 py-1 border-b border-slate-100 font-bold text-emerald-700">{r.producto}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.clienteLogistica}>{r.clienteLogistica || guion}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap">{sc ? sinc : (r.repre ? <span className="font-bold text-indigo-700">{r.repre}</span> : guion)}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.origen}>{sc ? sinc : r.origen}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.intermediario}>{sc ? sinc : (r.intermediario || guion)}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.rtteComercial}>{sc ? sinc : (r.rtteComercial || guion)}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.clienteAsignado}>{r.clienteAsignado || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap">{r.repre ? <span className="font-bold text-indigo-700">{r.repre}</span> : guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.origen}>{r.origen || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.intermediario}>{r.intermediario || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.rtteComercial}>{r.rtteComercial || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.comprador}>{r.comprador || guion}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.destino}>{r.destino || guion}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100 max-w-[180px] truncate" title={r.localidadDestino}>{r.localidadDestino || guion}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.comprador}>{r.comprador || guion}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100">{r.ctg}</td>
               </tr>
               );
             })}
-            {filtrados.length===0 && <tr><td colSpan="13" className="p-8 text-center text-slate-400 italic">No hay turnos que coincidan con los filtros.</td></tr>}
+            {filtrados.length===0 && <tr><td colSpan="14" className="p-8 text-center text-slate-400 italic">No hay turnos que coincidan con los filtros.</td></tr>}
           </tbody>
         </table>
       </div>
