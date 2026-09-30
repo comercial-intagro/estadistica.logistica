@@ -2,6 +2,10 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Análisis de Turnos - Intagro SA</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -33,6 +37,10 @@ const LOGISTICA_API = 'https://script.google.com/macros/s/AKfycby5tG5QU0kumyN1Cn
 const SUPABASE_URL = 'https://yfmqfafrvgydfnzsllcx.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_2ZCuxfolQ8OfAMnmazA7XQ_wV2EsoFI';
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Fecha de corte: Análisis de Turnos solo procesa turnos y cupos con fecha >= a esta.
+// Todo lo anterior queda afuera (arranque de cero desde el 1/10/2026).
+const FECHA_CORTE = '2026-10-01';
 
 // Lee TODA la tabla clientes con paginación (evita el tope de 1000 filas de Supabase).
 async function cargarClientesSupabase() {
@@ -157,6 +165,10 @@ const limpiarProducto = (s) => {
 const parseFecha = (s) => {
   if (!s) return null;
   const str = s.toString().trim();
+  // ISO: 2026-10-01 (con o sin hora)
+  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  // dd/mm/yyyy
   const m = str.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
   if (m) return `${m[3]}-${m[2]}-${m[1]}`;
   // por si viene como Date
@@ -310,7 +322,8 @@ async function cargarAsignadosSupabase() {
   let desde = 0, todos = [];
   for (;;) {
     const { data, error } = await sb.from('assigned_quotas')
-      .select('alfanumerico,client_name').range(desde, desde + pageSize - 1);
+      .select('alfanumerico,client_name,product,destino,destinatario,date,batch_comprador,estado_alfanumerico')
+      .range(desde, desde + pageSize - 1);
     if (error) throw error;
     todos = todos.concat(data || []);
     if (!data || data.length < pageSize) break;
@@ -382,6 +395,47 @@ function App() {
   const [tab, setTab] = useState('detalle');
   const [processing, setProcessing] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
+
+  // Marca de última importación de STOP (tabla app_meta, compartida con Gestión).
+  // Cuando cambia mientras la herramienta está abierta, mostramos un aviso sutil.
+  const [stopActualizado, setStopActualizado] = useState(null);
+  const [avisoActualizacion, setAvisoActualizacion] = useState(false);
+  const stopActualizadoRef = useRef(null);
+  const primeraCargaStopRef = useRef(true);
+  const leerMarcaStop = async () => {
+    try {
+      const { data } = await sb.from('app_meta').select('value').eq('key', 'ultima_actualizacion_stop').maybeSingle();
+      const val = data ? data.value : null;
+      if (primeraCargaStopRef.current) {
+        // primera lectura: solo guardamos, sin avisar
+        primeraCargaStopRef.current = false;
+        stopActualizadoRef.current = val;
+        setStopActualizado(val);
+      } else if (val && val !== stopActualizadoRef.current) {
+        // cambió después de tener la herramienta abierta → avisar (sin pisar los datos aún)
+        setAvisoActualizacion(true);
+      }
+    } catch(e) { console.error('Error leyendo marca STOP', e); }
+  };
+  useEffect(() => {
+    leerMarcaStop();
+    const ch = sb.channel('rt_app_meta')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_meta' }, () => leerMarcaStop())
+      .subscribe();
+    return () => { sb.removeChannel(ch); };
+  }, []);
+  // Al aceptar el aviso: recargamos turnos y asignados, y actualizamos la marca mostrada.
+  const aceptarActualizacion = async () => {
+    await Promise.all([cargarTurnos(), cargarAsignados(), cargarSupaLog()]);
+    // releer la marca para dejarla como referencia nueva
+    try {
+      const { data } = await sb.from('app_meta').select('value').eq('key', 'ultima_actualizacion_stop').maybeSingle();
+      const val = data ? data.value : null;
+      stopActualizadoRef.current = val;
+      setStopActualizado(val);
+    } catch(e) {}
+    setAvisoActualizacion(false);
+  };
   const [showAbm, setShowAbm] = useState(false);
   const [showDiag, setShowDiag] = useState(false);
   const [supaLog, setSupaLog] = useState({ map:{}, totalAlfas:0, totalQuotas:0 });
@@ -416,7 +470,7 @@ function App() {
     return () => { sb.removeChannel(ch); };
   }, []);
 
-  // Asignados (grilla 3 de Gestión): mapa alfanumérico -> cliente, para la columna Cliente.
+  // Asignados (grilla 3 de Gestión): mapa alfanumérico -> datos del cupo asignado.
   const [asignados, setAsignados] = useState({});
   const cargarAsignados = async () => {
     try {
@@ -424,7 +478,14 @@ function App() {
       const m = {};
       rows.forEach(a => {
         const k = normClave(a.alfanumerico);
-        if (k && a.client_name) m[k] = a.client_name;
+        if (k) m[k] = {
+          cliente: a.client_name || '',
+          producto: limpiarProducto(a.product || ''),
+          destino: limpiarCuit(a.destino || ''),
+          comprador: limpiarCuit(a.destinatario || a.batch_comprador || ''),
+          fecha: parseFecha(a.date || ''),
+          estado: a.estado_alfanumerico || ''
+        };
       });
       setAsignados(m);
     } catch(e) { console.error('Error cargando asignados', e); }
@@ -593,36 +654,40 @@ function App() {
     const dispMap = supaLog.map || {}; // alfanuméricos que están en Disponibilidad de Cupos
     const idsStop = new Set(Object.keys(data).map(id => normClave(id)));
 
-    // 1) Turnos de STOP enriquecidos
-    const stopEnriquecidos = Object.values(data).map(r => {
-      const cuitRtte = normCuit(r.rtteComercialCuit);
-      const cuitInter = normCuit(r.intermediarioCuit);
-      const cuitOrigen = normCuit(r.origenCuit);
-      const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
-      const enDisponibilidad = !!dispMap[normClave(r.id)];
-      // Semáforo:
-      // rojo = turno en STOP que NO está en Disponibilidad de Cupos (hay que cargarlo)
-      // (sin color) = turno en STOP que ya está en Disponibilidad
-      const semaforo = enDisponibilidad ? '' : 'rojo';
-      return {
-        ...r,
-        clienteAsignado: asignados[normClave(r.id)] || '',
-        enDisponibilidad,
-        repre: repreAbm,
-        semaforo,
-        fuente: 'stop'
-      };
-    });
+    // 1) Turnos de STOP enriquecidos (solo fecha >= corte)
+    const stopEnriquecidos = Object.values(data)
+      .filter(r => !r.fecha || r.fecha >= FECHA_CORTE)
+      .map(r => {
+        const cuitRtte = normCuit(r.rtteComercialCuit);
+        const cuitInter = normCuit(r.intermediarioCuit);
+        const cuitOrigen = normCuit(r.origenCuit);
+        const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
+        const enDisponibilidad = !!dispMap[normClave(r.id)];
+        const asig = asignados[normClave(r.id)];
+        // Semáforo:
+        // rojo = turno en STOP que NO está en Disponibilidad de Cupos (hay que cargarlo)
+        // (sin color) = turno en STOP que ya está en Disponibilidad
+        const semaforo = enDisponibilidad ? '' : 'rojo';
+        return {
+          ...r,
+          clienteAsignado: asig ? asig.cliente : '',
+          enDisponibilidad,
+          repre: repreAbm,
+          semaforo,
+          fuente: 'stop'
+        };
+      });
 
-    // 2) Cupos asignados (grilla 3) que NO aparecen en el STOP → punto negro
+    // 2) Cupos asignados (grilla 3) que NO aparecen en el STOP → punto negro (solo fecha >= corte)
     const soloAsignados = Object.entries(asignados)
-      .filter(([alfa]) => !idsStop.has(alfa))
-      .map(([alfa, cliente]) => ({
+      .filter(([alfa, a]) => !idsStop.has(alfa) && (!a.fecha || a.fecha >= FECHA_CORTE))
+      .map(([alfa, a]) => ({
         id: alfa,
-        estado: '', fecha: '', producto: '', destino: '', localidadDestino: '',
-        comprador: '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
+        estado: a.estado || '', fecha: a.fecha || '', producto: a.producto || '',
+        destino: a.destino || '', localidadDestino: '',
+        comprador: a.comprador || '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
         contrato: '', activoEnStop: null,
-        clienteAsignado: cliente,
+        clienteAsignado: a.cliente || '',
         enDisponibilidad: true,
         repre: '',
         semaforo: 'negro',
@@ -659,19 +724,23 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             <span className={`text-[11px] font-bold px-2 py-1 rounded ${turnosEstado==='ok'?'bg-emerald-900/40 text-emerald-100':turnosEstado==='error'?'bg-red-900/50 text-red-100':'bg-amber-900/40 text-amber-100'}`}>
-              {turnosEstado==='ok' ? `${registros.length} turnos` : turnosEstado==='error' ? 'Turnos ERROR' : 'Cargando turnos...'} {lastUpdate && `· ${new Date(lastUpdate).toLocaleString('es-AR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}`}
+              {turnosEstado==='ok' ? `${registros.length} turnos` : turnosEstado==='error' ? 'Turnos ERROR' : 'Cargando turnos...'}
             </span>
-            <label className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition shadow-sm ${processing ? 'bg-slate-400 cursor-wait' : 'bg-white text-emerald-800 hover:bg-emerald-50'}`}>
-              <IconUpload className="w-4 h-4"/>{processing ? (uploadProg || 'Procesando...') : 'Subir Excel STOP'}
-              <input type="file" accept=".xlsx,.xls" onChange={handleUpload} disabled={processing} className="hidden"/>
-            </label>
-            <button onClick={()=>setShowAbm(true)} className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm border ${clientesEstado==='ok'?'bg-emerald-900/50 text-white hover:bg-emerald-900/70 border-emerald-600/40':clientesEstado==='error'?'bg-red-900/50 text-red-100 border-red-400/40':'bg-amber-900/40 text-amber-100 border-amber-400/40'}`} title={clientesEstado==='error'?('Clientes: '+clientesError):'Ver clientes / representantes (se editan en Gestión Logística)'}>
-              <IconUsers className="w-4 h-4"/> Clientes {clientesEstado==='ok' ? clientes.length : clientesEstado==='error' ? 'ERROR' : '...'}
-            </button>
-            <button onClick={borrarTodo} className="bg-red-900/40 hover:bg-red-700 text-red-100 p-1.5 rounded-lg transition" title="Borrar todos los datos"><IconTrash className="w-4 h-4"/></button>
+            <span className="text-[11px] text-emerald-100 bg-emerald-900/40 px-2 py-1 rounded" title="Fecha de la última importación del STOP (se hace desde Gestión Logística)">
+              STOP: {stopActualizado ? new Date(stopActualizado).toLocaleString('es-AR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : 'sin datos'}
+            </span>
           </div>
         </div>
       </div>
+
+      {/* AVISO SUTIL DE NUEVA ACTUALIZACIÓN DE STOP */}
+      {avisoActualizacion && (
+        <div className="fixed top-3 right-3 z-50 bg-orange-500 text-white rounded-lg shadow-lg px-4 py-2.5 flex items-center gap-3" style={{maxWidth:'340px'}}>
+          <div className="text-xs font-bold leading-tight">Hay una nueva actualización de STOP disponible.</div>
+          <button onClick={aceptarActualizacion} className="bg-white text-orange-600 hover:bg-orange-50 text-xs font-bold px-3 py-1 rounded shadow shrink-0">Actualizar</button>
+          <button onClick={()=>setAvisoActualizacion(false)} className="text-orange-100 hover:text-white text-lg leading-none shrink-0" title="Descartar por ahora">×</button>
+        </div>
+      )}
 
       {/* TABS */}
       <div className="bg-white border-b border-slate-200 px-4 flex gap-1">
@@ -892,7 +961,7 @@ function DetalleTab({ registros, abrirCargaCupos }) {
   // Selección de turnos con punto rojo para cargarlos a Disponibilidad de Cupos
   const [seleccion, setSeleccion] = useState(new Set()); // set de ids seleccionados
   // Clave de coincidencia: producto + destinatario + destino + fecha
-  const claveCoincidencia = (r) => [r.producto, r.comprador, r.destino, r.fecha].map(x => (x||'').toString().trim().toUpperCase()).join('||');
+  const claveCoincidencia = (r) => [r.producto, r.comprador, r.destino, r.localidadDestino, r.fecha].map(x => (x||'').toString().trim().toUpperCase()).join('||');
   // Cuando hay selección, calculamos la clave de referencia (la del primer seleccionado)
   const clavesSeleccionadas = useMemo(() => {
     const s = new Set();
