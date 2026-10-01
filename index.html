@@ -2,10 +2,6 @@
 <html lang="es">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
-
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Análisis de Turnos - Intagro SA</title>
 <script src="https://cdn.tailwindcss.com"></script>
@@ -38,10 +34,6 @@ const SUPABASE_URL = 'https://yfmqfafrvgydfnzsllcx.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_2ZCuxfolQ8OfAMnmazA7XQ_wV2EsoFI';
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Fecha de corte: Análisis de Turnos solo procesa turnos y cupos con fecha >= a esta.
-// Todo lo anterior queda afuera (arranque de cero desde el 1/10/2026).
-const FECHA_CORTE = '2026-10-01';
-
 // Lee TODA la tabla clientes con paginación (evita el tope de 1000 filas de Supabase).
 async function cargarClientesSupabase() {
   const pageSize = 1000;
@@ -57,30 +49,6 @@ async function cargarClientesSupabase() {
   // Mapeamos al shape que ya usa el resto de la app: {cliente, cuit, repre}
   return todos.map(c => ({ cliente: c.cliente || '', cuit: c.cuit || '', repre: c.repre_comercial || '' }));
 }
-
-// Carga de tablas para el formulario de carga de cupos (destinos, intervinientes, plantillas)
-async function cargarTablaSupabase(tabla, cols, orderBy) {
-  const pageSize = 1000;
-  let desde = 0, todos = [];
-  for (;;) {
-    let q = sb.from(tabla).select(cols).range(desde, desde + pageSize - 1);
-    if (orderBy) q = q.order(orderBy, { ascending: true });
-    const { data, error } = await q;
-    if (error) throw error;
-    todos = todos.concat(data || []);
-    if (!data || data.length < pageSize) break;
-    desde += pageSize;
-  }
-  return todos;
-}
-const mapDestinoFromDb = (d) => ({
-  id: d.id, idDestino: d.id_destino || '', cuit: d.cuit || '', descripcion: d.descripcion || '',
-  codigoPlanta: d.codigo_planta || '', direccion: d.direccion || '', localidad: d.localidad || '',
-  provincia: d.provincia || '', producto: d.producto || '', zonaComercial: d.zona_comercial || '',
-  subZonaComercial: d.sub_zona_comercial || ''
-});
-const mapIntervinienteFromDb = (i) => ({ id: i.id, cuit: i.cuit || '', descripcion: i.descripcion || '' });
-const mapTemplateFromDb = (t) => ({ id: t.id, name: t.name, data: t.data });
 
 // DIAGNÓSTICO 3b: lee quota_alfanumericos + buyer_quotas para comparar el cruce de
 // SIN CTG contra la fuente actual (JSONP). Devuelve un mapa por alfanumérico normalizado.
@@ -189,10 +157,6 @@ const limpiarProducto = (s) => {
 const parseFecha = (s) => {
   if (!s) return null;
   const str = s.toString().trim();
-  // ISO: 2026-10-01 (con o sin hora)
-  const iso = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
-  // dd/mm/yyyy
   const m = str.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
   if (m) return `${m[3]}-${m[2]}-${m[1]}`;
   // por si viene como Date
@@ -339,23 +303,6 @@ async function cargarTurnosSupabase() {
   return todos;
 }
 
-// Lee los cupos asignados (grilla 3 de Gestión) para cruzar por alfanumérico:
-// de ahí sale el Cliente al que se asignó cada turno.
-async function cargarAsignadosSupabase() {
-  const pageSize = 1000;
-  let desde = 0, todos = [];
-  for (;;) {
-    const { data, error } = await sb.from('assigned_quotas')
-      .select('alfanumerico,client_name,product,destino,destinatario,date,batch_comprador,estado_alfanumerico')
-      .range(desde, desde + pageSize - 1);
-    if (error) throw error;
-    todos = todos.concat(data || []);
-    if (!data || data.length < pageSize) break;
-    desde += pageSize;
-  }
-  return todos;
-}
-
 // Upsert en lotes de 50 con pausa entre cada uno.
 // ANTES del upsert, marca como inactivos los turnos del rango de fechas
 // que ya no aparecen en el nuevo Excel (punto violeta).
@@ -409,389 +356,6 @@ async function upsertTurnosSupabase(registros, onProgreso) {
 }
 
 // ==================== APP ====================
-// ==================== FORMULARIO DE CARGA DE CUPOS (portado de Gestión) ====================
-// Objeto Icons compatible con el formulario portado (usa el componente Icon base de esta app).
-const Icons = {
-  X: (p) => <Icon {...p} d={<><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>} />,
-  Save: (p) => <Icon {...p} d={<><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></>} />,
-  Layers: (p) => <Icon {...p} d={<><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></>} />,
-  Clipboard: (p) => <Icon {...p} d={<><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></>} />,
-  CheckCircle: (p) => <Icon {...p} d={<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>} />,
-  ListChecks: (p) => <Icon {...p} d={<><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></>} />,
-  RefreshCw: (p) => <Icon {...p} d={<><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></>} />,
-  Search: (p) => <Icon {...p} d={<><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></>} />,
-};
-
-        const MOCK_OPTIONS = {
-            productos: ['SOJA', 'MAIZ', 'TRIGO', 'GIRASOL', 'SORGO', 'CEBADA'],
-            compradores: [
-                'BUNGE ARGENTINA S.A.', 'CARGILL S.A.C.I.', 'LDC ARGENTINA S.A.', 
-                'VITERRA ARGENTINA S.A.', 'ACA COOP. LTDA.', 'AFA S.C.L.', 
-                'JUMEIRA AGRO S.A.', 'ARGENTRADING S.A.', 'MERLO Y MANAVELLA S.A.',
-                'MOLINOS AGRO S.A.', 'INTAGRO SOCIEDAD ANONIMA', 'MADER SAS',
-                'AVANZAR SRL', 'ADM SA'
-            ],
-            empresas: [
-                '30500175829 - BUNGE ARGENTINA S.A.', 
-                '30506730038 - CARGILL S.A.C.I.', 
-                '30501111113 - LDC ARGENTINA S.A.', 
-                '30712577670 - VITERRA ARGENTINA S.A.', 
-                '30500120889 - ACA COOP. LTDA.', 
-                '30500132399 - AFA S.C.L.', 
-                '30708912345 - JUMEIRA AGRO S.A.', 
-                '30711629048 - ARGENTRADING S.A.', 
-                '30526412792 - MERLO Y MANAVELLA S.A.',
-                '30715118773 - MOLINOS AGRO S.A.',
-                '30663290262 - INTAGRO SOCIEDAD ANONIMA',
-                '30716281074 - MADER SAS',
-                '30714505674 - ADM SA'
-            ],
-            mercados: ['30500006509 - MATBA ROFEX S.A.', 'Física', 'Directo'],
-            destinos: [
-                '30700755434 - TERMINAL 6 S.A.', 
-                '30506730038 - PLANTA ALVEAR (CARGILL)', 
-                '30500175829 - BUNGE PUERTO G.S.M.', 
-                '30710461879 - RENOVA TIMBUES', 
-                '30501111113 - LDC GENERAL LAGOS', 
-                '30715118773 - MOLINOS AGRO (SAN LORENZO)',
-                '30715118773 - ZONA ROSARIO NORTE', 
-                '30715118773 - ZONA ROSARIO SUR',
-                '30714505674 - ADM SA - El Transito Pto. Gral. San Martin',
-                '30714505674 - ADM SA - Arroyo Seco'
-            ],
-            localidades: ['San Lorenzo', 'Timbúes', 'Puerto Gral. San Martín', 'Rosario', 'General Lagos', 'San Nicolás', 'Bahía Blanca', 'Arroyo Seco'],
-            provincias: ['Santa Fe', 'Buenos Aires', 'Córdoba', 'Entre Ríos']
-        };
-
-        const TolerantSelect = ({ value, onChange, options, className, placeholder = 'Seleccionar...' }) => {
-            const opts = useMemo(() => {
-                const base = (options || []).filter(Boolean);
-                const v = (value || '').toString();
-                if (v && !base.some(o => o === v)) return [v, ...base];
-                return base;
-            }, [options, value]);
-            return (
-                <select className={className} value={value || ''} onChange={onChange}>
-                    <option value="">{placeholder}</option>
-                    {opts.map(o => <option key={o} value={o}>{o}</option>)}
-                </select>
-            );
-        };
-
-        const FormRow = ({ label, required, children }) => (
-            <div className="flex items-center gap-4 py-1.5 border-b border-slate-200/60 last:border-0 hover:bg-blue-50/50 px-4 transition-colors">
-                <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0" title={label}>
-                    {label} {required && <span className="text-red-500">*</span>}
-                </label>
-                <div className="flex-1">
-                    {children}
-                </div>
-            </div>
-        );
-
-        function ManageAlfaModal({ batch, onClose, onSave }) {
-             const [localAlfas, setLocalAlfas] = useState([...batch.alfanumericos.map(a => typeof a === 'string' ? {code: a, status: 'disponible'} : a)]);
-             const [selected, setSelected] = useState([]);
-             const [searchTerm, setSearchTerm] = useState('');
-
-             const filteredAlfas = useMemo(() => {
-                 if (!searchTerm) return localAlfas;
-                 return localAlfas.filter(a => a.code.toLowerCase().includes(searchTerm.toLowerCase()));
-             }, [localAlfas, searchTerm]);
-
-             const toggleAll = (e) => {
-                 if (e.target.checked) {
-                     const filteredCodes = filteredAlfas.map(a => a.code);
-                     setSelected(Array.from(new Set([...selected, ...filteredCodes])));
-                 } else {
-                     const filteredCodes = filteredAlfas.map(a => a.code);
-                     setSelected(selected.filter(code => !filteredCodes.includes(code)));
-                 }
-             };
-
-             const toggleOne = (code) => setSelected(prev => prev.includes(code) ? prev.filter(c => c !== code) : [...prev, code]);
-
-             const applyStatus = (newStatus) => {
-                 if (selected.length === 0) return;
-                 setLocalAlfas(prev => prev.map(a => selected.includes(a.code) ? { ...a, status: newStatus } : a));
-                 setSelected([]);
-             };
-
-             const allFilteredSelected = filteredAlfas.length > 0 && filteredAlfas.every(a => selected.includes(a.code));
-
-             return (
-                 <div className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
-                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl flex flex-col animate-slide-in overflow-hidden border border-blue-200">
-                        <div className="bg-slate-800 p-4 flex justify-between items-center text-white shrink-0">
-                            <h3 className="font-bold flex items-center gap-2"><Icons.ListChecks className="w-5 h-5"/> Gestionar Estados - {batch.comprador}</h3>
-                            <button onClick={onClose} className="hover:text-slate-300 transition"><Icons.X className="w-5 h-5"/></button>
-                        </div>
-
-                        <div className="bg-slate-50 p-3 border-b border-slate-200 flex items-center gap-2 shrink-0">
-                            <Icons.Search className="w-5 h-5 text-slate-400" />
-                            <input type="text" placeholder="Pegar o escribir código alfanumérico..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="flex-1 bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all font-mono" />
-                            {searchTerm && <button onClick={() => setSearchTerm('')} className="p-2 text-slate-400 hover:text-red-500 transition rounded-md hover:bg-red-50" title="Limpiar búsqueda"><Icons.X className="w-4 h-4"/></button>}
-                        </div>
-
-                        <div className="p-4 flex-1 overflow-y-auto max-h-[55vh] bg-slate-50 custom-scroll">
-                            <table className="w-full text-left text-sm border-collapse bg-white rounded-lg shadow-sm overflow-hidden border border-slate-200">
-                                <thead className="bg-slate-100 border-b border-slate-200 sticky top-0 z-10">
-                                    <tr>
-                                        <th className="p-2 w-10 text-center"><input type="checkbox" onChange={toggleAll} checked={allFilteredSelected} className="accent-blue-600 w-3.5 h-3.5 cursor-pointer" title="Seleccionar visibles"/></th>
-                                        <th className="p-2 font-bold text-slate-600 text-xs uppercase tracking-wider">Código Alfanumérico</th>
-                                        <th className="p-2 font-bold text-slate-600 text-xs uppercase tracking-wider text-center">Estado Actual</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-slate-100">
-                                    {filteredAlfas.map(alfa => (
-                                        <tr key={alfa.code} className={`hover:bg-slate-50 transition-colors ${selected.includes(alfa.code) ? 'bg-blue-50/50' : ''}`}>
-                                            <td className="p-2 text-center"><input type="checkbox" checked={selected.includes(alfa.code)} onChange={() => toggleOne(alfa.code)} className="accent-blue-600 w-3.5 h-3.5 cursor-pointer"/></td>
-                                            <td className="p-2 font-mono font-medium text-slate-700">{alfa.code}</td>
-                                            <td className="p-2 text-center">
-                                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase border shadow-sm ${alfa.status === 'disponible' ? 'bg-green-100 text-green-700 border-green-200' : (alfa.status === 'asignado' ? 'bg-blue-100 text-blue-700 border-blue-200' : (alfa.status === 'anulado' ? 'bg-red-100 text-red-700 border-red-200' : 'bg-orange-100 text-orange-700 border-orange-200'))}`}>{alfa.status}</span>
-                                            </td>
-                                        </tr>
-                                    ))}
-                                    {filteredAlfas.length === 0 && <tr><td colSpan="3" className="p-6 text-center text-slate-400 italic">No se encontraron códigos que coincidan con la búsqueda.</td></tr>}
-                                </tbody>
-                            </table>
-                        </div>
-                        <div className="bg-white border-t border-slate-200 p-4 flex flex-col sm:flex-row justify-between items-center gap-4 shrink-0">
-                            <div className="text-sm font-bold text-slate-500 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200">{selected.length} seleccionados</div>
-                            <div className="flex flex-wrap gap-2 justify-center">
-                                <button onClick={() => applyStatus('anulado')} disabled={selected.length===0} className="bg-red-500 hover:bg-red-600 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg font-bold text-xs shadow-sm transition active:scale-95">ANULAR</button>
-                                <button onClick={() => applyStatus('devuelto')} disabled={selected.length===0} className="bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg font-bold text-xs shadow-sm transition active:scale-95">DEVOLVER</button>
-                                <button onClick={() => applyStatus('disponible')} disabled={selected.length===0} className="bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg font-bold text-xs shadow-sm transition flex items-center gap-1 active:scale-95"><Icons.RefreshCw className="w-3.5 h-3.5"/> REVERTIR</button>
-                            </div>
-                            <button onClick={() => onSave(batch.id, localAlfas)} className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold text-sm shadow-md transition w-full sm:w-auto active:scale-95">Guardar Cambios</button>
-                        </div>
-                    </div>
-                 </div>
-             )
-        }
-
-        function AddCuposModal({ onClose, onSave, templates, saveTemplate, editData, destinos = [], intervinientes = [], templateMode = false }) {
-            const [alfanumericos, setAlfanumericos] = useState('');
-            const [templateName, setTemplateName] = useState('');
-            const [showAlfaModal, setShowAlfaModal] = useState(false);
-            
-            const [form, setForm] = useState({
-                fechaCupo: '', producto: '', comprador: '', observacionesCalidad: '', rteVentaPrimaria: '', rteVentaSecundaria: '', rteVentaSecundaria2: '',
-                mercadoTermino: '', corredorPrimaria: '', corredorSecundaria: '', repreEntregador: '', repreRecibidor: '',
-                destinatario: '', destino: '', nroPlanta: '', direccionDestino: '', localidad: '', provincia: '', observaciones: ''
-            });
-
-            useEffect(() => {
-                if (editData && editData.fullCpData) {
-                    setForm(editData.fullCpData);
-                    const alfaStr = (editData.alfanumericos || []).map(a => typeof a === 'object' ? a.code : a).join('\n');
-                    setAlfanumericos(alfaStr);
-                    if (editData._templateName) setTemplateName(editData._templateName);
-                }
-            }, [editData]);
-
-            const parsedCodes = useMemo(() => {
-                return alfanumericos.split(/[\s,]+/).map(s => s.trim().toUpperCase()).filter(s => s.length > 0);
-            }, [alfanumericos]);
-
-            const handleChange = (field, val) => setForm(prev => ({...prev, [field]: val}));
-
-            const handleLoadTemplate = (e) => {
-                const tName = e.target.value;
-                if (!tName) return;
-                const tmpl = templates.find(t => t.name === tName);
-                if (tmpl) setForm(tmpl.data);
-            };
-
-            const handleSaveTemplate = async () => {
-                if (!templateName.trim()) return alert("Ingresa un nombre para la plantilla.");
-                if (saveTemplate) {
-                    await saveTemplate(templateName, form);
-                    alert("Plantilla guardada con éxito.");
-                }
-                setTemplateName('');
-            };
-
-            const handleSaveBatch = () => {
-                if (parsedCodes.length === 0) return alert("Debes ingresar al menos 1 código alfanumérico. Utiliza el botón 'Pegar Alfanuméricos'.");
-                if (parsedCodes.length > 300) return alert("El máximo permitido es 300 códigos por lote.");
-                if (!form.fechaCupo) return alert("La Fecha del cupo es obligatoria.");
-                if (!form.producto || !form.comprador) return alert("Producto y Comprador son obligatorios.");
-
-                onSave({
-                    ...form,
-                    alfanumericosList: parsedCodes
-                });
-            };
-
-            // Opciones de intervinientes desde el ABM (fallback a MOCK si está vacío)
-            const intervOpts = useMemo(() => {
-                const fromAbm = (intervinientes || []).map(i => i.descripcion).filter(Boolean);
-                return fromAbm.length > 0 ? fromAbm : MOCK_OPTIONS.empresas;
-            }, [intervinientes]);
-
-            // Destinos filtrados por el producto elegido en la CP
-            const destinosFiltrados = useMemo(() => {
-                if (!form.producto) return [];
-                const prod = (form.producto || '').toUpperCase();
-                return (destinos || []).filter(d => {
-                    const dp = (d.producto || '').toUpperCase();
-                    return dp === prod || dp === 'TODOS';
-                });
-            }, [destinos, form.producto]);
-
-            // Al elegir un destino, autocompletar los datos asociados
-            const selectDestino = (descripcion) => {
-                if (!descripcion) { handleChange('destino', ''); return; }
-                const d = destinosFiltrados.find(x => x.descripcion === descripcion);
-                if (!d) { handleChange('destino', descripcion); return; }
-                setForm(prev => ({
-                    ...prev,
-                    destino: d.descripcion,
-                    nroPlanta: d.codigoPlanta || '',
-                    direccionDestino: d.direccion || '',
-                    localidad: d.localidad || '',
-                    provincia: d.provincia || '',
-                    destinoCuit: d.cuit || ''
-                }));
-            };
-
-            const onDestinoMouseDown = (e) => {
-                if (!form.producto) { e.preventDefault(); alert('Primero seleccioná el Producto de la carta de porte para poder elegir el destino.'); }
-            };
-
-            return (
-                <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
-                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl flex flex-col animate-slide-in border border-blue-200 relative max-h-[98vh]">
-                        
-                        {/* SUB-MODAL ALFANUMÉRICO (FLOTANTE) */}
-                        {showAlfaModal && (
-                            <div className="absolute inset-0 z-50 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 rounded-xl">
-                                <div className="bg-white rounded-xl shadow-xl w-full max-w-md p-5 flex flex-col animate-slide-in border border-blue-200">
-                                    <div className="flex justify-between items-center mb-3">
-                                        <h4 className="font-bold text-blue-900 flex items-center gap-2"><Icons.Layers className="w-4 h-4"/> Pegar Alfanuméricos</h4>
-                                        <button onClick={() => setShowAlfaModal(false)} className="text-slate-400 hover:text-slate-600"><Icons.X className="w-5 h-5"/></button>
-                                    </div>
-                                    <p className="text-[11px] text-slate-500 mb-3 leading-tight">Separa los códigos por salto de línea o coma. Máximo 300 por lote.</p>
-                                    <textarea 
-                                        className="flex-1 min-h-[200px] w-full border border-slate-300 rounded-lg p-3 text-sm font-mono text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none custom-scroll resize-none"
-                                        placeholder="Ej: ABC12345&#10;XYZ98765&#10;..."
-                                        value={alfanumericos}
-                                        onChange={e => setAlfanumericos(e.target.value)}
-                                    ></textarea>
-                                    <div className="mt-4 flex justify-between items-center">
-                                        <div className={`px-3 py-1.5 rounded text-center font-bold text-xs ${parsedCodes.length > 300 ? 'bg-red-100 text-red-700' : 'bg-blue-50 text-blue-800 border border-blue-200'}`}>
-                                            {parsedCodes.length} / 300 detectados
-                                        </div>
-                                        <button onClick={() => setShowAlfaModal(false)} className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2 rounded-lg shadow-sm transition active:scale-95">Listo</button>
-                                    </div>
-                                </div>
-                            </div>
-                        )}
-
-                        <div className="bg-gradient-to-r from-blue-900 to-blue-700 p-3 flex justify-between items-center text-white shrink-0 rounded-t-xl">
-                            <div className="flex items-center gap-2">
-                                <Icons.Clipboard className="w-4 h-4 text-blue-300" />
-                                <h3 className="font-bold text-sm">Modelo de Carta de Porte</h3>
-                            </div>
-                            <div className="flex items-center gap-3">
-                                <button 
-                                    onClick={() => setShowAlfaModal(true)} 
-                                    className={`text-xs font-bold px-3 py-1.5 rounded-md flex items-center gap-1.5 transition shadow-sm ${parsedCodes.length > 0 ? 'bg-emerald-500 hover:bg-emerald-400 text-white' : 'bg-blue-800 hover:bg-blue-600 border border-blue-500/50'}`}
-                                >
-                                    <Icons.Layers className="w-3.5 h-3.5"/>
-                                    {parsedCodes.length > 0 ? `${parsedCodes.length} Códigos Cargados` : 'Pegar Alfanuméricos'}
-                                </button>
-                                <button onClick={onClose} className="text-blue-200 hover:text-white transition p-1"><Icons.X className="w-5 h-5" /></button>
-                            </div>
-                        </div>
-
-                        <div className="bg-blue-50/50 border-b border-blue-100 p-2.5 flex flex-wrap gap-4 items-center shadow-sm shrink-0">
-                            <div className="flex items-center gap-2 flex-1 min-w-[200px]">
-                                <span className="text-[10px] font-bold text-blue-800 uppercase whitespace-nowrap">Plantilla:</span>
-                                <select className="flex-1 p-1 border border-blue-200 rounded text-xs bg-white focus:ring-1 outline-none" onChange={handleLoadTemplate}>
-                                    <option value="">-- Cargar Existente --</option>
-                                    {templates.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
-                                </select>
-                            </div>
-                            <div className="w-px h-5 bg-blue-200 hidden md:block"></div>
-                            <div className="flex items-center gap-2 flex-1 min-w-[200px]">
-                                <span className="text-[10px] font-bold text-blue-800 uppercase whitespace-nowrap">Guardar:</span>
-                                <input type="text" placeholder="Ej: BUNGE - MAIZ" value={templateName} onChange={e=>setTemplateName(e.target.value)} className="flex-1 p-1 border border-blue-200 rounded text-xs bg-white focus:ring-1 outline-none"/>
-                                <button onClick={handleSaveTemplate} className="bg-blue-600 hover:bg-blue-700 text-white p-1 rounded transition" title="Guardar como Plantilla"><Icons.Save className="w-3.5 h-3.5"/></button>
-                            </div>
-                        </div>
-
-                        <div className="p-4 bg-slate-50 flex-1 overflow-y-auto custom-scroll">
-                            <div className="flex flex-col max-w-3xl mx-auto bg-white border border-slate-200 shadow-sm rounded-lg py-1">
-                                
-                                <div className="flex items-center gap-2 py-2 border-b-2 border-emerald-200 bg-emerald-50/60 px-4">
-                                    <label className="text-[11px] font-extrabold text-emerald-800 uppercase shrink-0">📅 Fecha del Cupo <span className="text-red-500">*</span></label>
-                                    <input type="date" value={form.fechaCupo} onChange={e=>handleChange('fechaCupo', e.target.value)} className="flex-1 max-w-[220px] p-1.5 border-2 border-emerald-300 rounded text-xs font-bold text-emerald-900 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 bg-white transition" />
-                                    <span className="text-[10px] text-slate-500 italic">Día para el que sirven estos cupos</span>
-                                </div>
-
-                                <div className="flex flex-col md:flex-row items-start md:items-center gap-2 md:gap-4 py-1.5 border-b border-slate-200/60 hover:bg-blue-50/50 px-4 transition-colors">
-                                    <div className="flex items-center gap-2 w-full md:w-1/2">
-                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Producto <span className="text-red-500">*</span></label>
-                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.producto} onChange={e=>handleChange('producto', e.target.value)} options={MOCK_OPTIONS.productos} />
-                                    </div>
-                                    <div className="flex items-center gap-2 w-full md:w-1/2">
-                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Comprador <span className="text-red-500">*</span></label>
-                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.comprador} onChange={e=>handleChange('comprador', e.target.value)} options={intervOpts} />
-                                    </div>
-                                </div>
-
-                                <FormRow label="Observaciones Calidad"><input type="text" placeholder="Ej: Conforme, Condicional..." className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.observacionesCalidad} onChange={e=>handleChange('observacionesCalidad', e.target.value)} /></FormRow>
-                                <FormRow label="Rte. Comercial Venta Primaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.rteVentaPrimaria} onChange={e=>handleChange('rteVentaPrimaria', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Rte. Comercial Venta Secundaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.rteVentaSecundaria} onChange={e=>handleChange('rteVentaSecundaria', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Rte. Comercial Venta Secundaria 2"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.rteVentaSecundaria2} onChange={e=>handleChange('rteVentaSecundaria2', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Mercado a Término"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.mercadoTermino} onChange={e=>handleChange('mercadoTermino', e.target.value)} options={MOCK_OPTIONS.mercados} /></FormRow>
-                                <FormRow label="Corredor Venta Primaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.corredorPrimaria} onChange={e=>handleChange('corredorPrimaria', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Corredor Venta Secundaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.corredorSecundaria} onChange={e=>handleChange('corredorSecundaria', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Representante Entregador"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.repreEntregador} onChange={e=>handleChange('repreEntregador', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Representante Recibidor"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.repreRecibidor} onChange={e=>handleChange('repreRecibidor', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Destinatario"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.destinatario} onChange={e=>handleChange('destinatario', e.target.value)} options={intervOpts} /></FormRow>
-                                <FormRow label="Destino"><select onMouseDown={onDestinoMouseDown} disabled={!form.producto} className={`w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition ${!form.producto ? 'bg-slate-100 cursor-not-allowed text-slate-400' : 'bg-slate-50 hover:bg-white'}`} value={form.destino} onChange={e=>selectDestino(e.target.value)}><option value="">{form.producto ? 'Seleccionar...' : 'Elegí producto primero'}</option>{form.destino && !destinosFiltrados.some(d=>d.descripcion===form.destino) && <option value={form.destino}>{form.destino}</option>}{destinosFiltrados.map(d=><option key={d.id} value={d.descripcion}>{d.descripcion}{d.codigoPlanta?` (Planta ${d.codigoPlanta})`:''}</option>)}</select></FormRow>
-
-                                <div className="flex flex-col md:flex-row items-start md:items-center gap-2 md:gap-4 py-1.5 border-b border-slate-200/60 hover:bg-blue-50/50 px-4 transition-colors">
-                                    <div className="flex items-center gap-2 w-full md:w-[35%]">
-                                        <label className="w-1/3 md:w-[45%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Nro Planta</label>
-                                        <input type="text" maxLength="6" className="w-20 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition text-center font-mono font-bold text-slate-700" value={form.nroPlanta} onChange={e=>handleChange('nroPlanta', e.target.value)}/>
-                                    </div>
-                                    <div className="flex items-center gap-2 w-full md:w-[65%]">
-                                        <label className="w-1/3 md:w-[25%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Dirección</label>
-                                        <input type="text" className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.direccionDestino} onChange={e=>handleChange('direccionDestino', e.target.value)}/>
-                                    </div>
-                                </div>
-                                
-                                <div className="flex flex-col md:flex-row items-start md:items-center gap-2 md:gap-4 py-1.5 border-b border-slate-200/60 hover:bg-blue-50/50 px-4 transition-colors">
-                                    <div className="flex items-center gap-2 w-full md:w-1/2">
-                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Localidad</label>
-                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.localidad} onChange={e=>handleChange('localidad', e.target.value)} options={MOCK_OPTIONS.localidades} />
-                                    </div>
-                                    <div className="flex items-center gap-2 w-full md:w-1/2">
-                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Provincia</label>
-                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.provincia} onChange={e=>handleChange('provincia', e.target.value)} options={MOCK_OPTIONS.provincias} />
-                                    </div>
-                                </div>
-                                
-                                <FormRow label="Observaciones Carta de Porte"><input type="text" placeholder="Escritura libre..." className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.observaciones} onChange={e=>handleChange('observaciones', e.target.value)} /></FormRow>
-                            </div>
-                        </div>
-
-                        <div className="bg-white border-t border-slate-200 p-3 flex justify-end gap-3 shrink-0 rounded-b-xl z-20">
-                            <button onClick={onClose} className="px-5 py-2 text-sm font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition">Cancelar</button>
-                            <button onClick={handleSaveBatch} className="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold px-6 py-2 rounded-lg shadow-md transition flex items-center gap-2 active:scale-95">
-                                <Icons.CheckCircle className="w-4 h-4"/> Guardar {parsedCodes.length} Cupos
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            );
-        }
-
-
 function App() {
   const [data, setData] = useState({}); // { id: registro }
   const [turnosEstado, setTurnosEstado] = useState('cargando');
@@ -799,69 +363,9 @@ function App() {
   const [clientes, setClientes] = useState([]); // [{cliente, cuit, repre}] leídos de Supabase
   const [clientesEstado, setClientesEstado] = useState('cargando');
   const [clientesError, setClientesError] = useState('');
-  // Datos para el formulario de carga de cupos
-  const [destinos, setDestinos] = useState([]);
-  const [intervinientes, setIntervinientes] = useState([]);
-  const [cpTemplates, setCpTemplates] = useState([]);
-  const cargarDatosFormulario = async () => {
-    try {
-      const [d, i, t] = await Promise.all([
-        cargarTablaSupabase('destinos', '*', 'descripcion'),
-        cargarTablaSupabase('intervinientes', '*', 'descripcion'),
-        cargarTablaSupabase('cp_templates', '*', 'name')
-      ]);
-      setDestinos(d.map(mapDestinoFromDb));
-      setIntervinientes(i.map(mapIntervinienteFromDb));
-      setCpTemplates(t.map(mapTemplateFromDb));
-    } catch(e) { console.error('Error cargando datos del formulario', e); }
-  };
-  useEffect(() => { cargarDatosFormulario(); }, []);
-  // Estado del modal de carga de cupos (se abre desde la selección de turnos rojos)
-  const [cargaCupos, setCargaCupos] = useState(null); // null o { editData }
   const [tab, setTab] = useState('detalle');
   const [processing, setProcessing] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
-
-  // Marca de última importación de STOP (tabla app_meta, compartida con Gestión).
-  // Cuando cambia mientras la herramienta está abierta, mostramos un aviso sutil.
-  const [stopActualizado, setStopActualizado] = useState(null);
-  const [avisoActualizacion, setAvisoActualizacion] = useState(false);
-  const stopActualizadoRef = useRef(null);
-  const primeraCargaStopRef = useRef(true);
-  const leerMarcaStop = async () => {
-    try {
-      const { data } = await sb.from('app_meta').select('value').eq('key', 'ultima_actualizacion_stop').maybeSingle();
-      const val = data ? data.value : null;
-      if (primeraCargaStopRef.current) {
-        // primera lectura: solo guardamos, sin avisar
-        primeraCargaStopRef.current = false;
-        stopActualizadoRef.current = val;
-        setStopActualizado(val);
-      } else if (val && val !== stopActualizadoRef.current) {
-        // cambió después de tener la herramienta abierta → avisar (sin pisar los datos aún)
-        setAvisoActualizacion(true);
-      }
-    } catch(e) { console.error('Error leyendo marca STOP', e); }
-  };
-  useEffect(() => {
-    leerMarcaStop();
-    const ch = sb.channel('rt_app_meta')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'app_meta' }, () => leerMarcaStop())
-      .subscribe();
-    return () => { sb.removeChannel(ch); };
-  }, []);
-  // Al aceptar el aviso: recargamos turnos y asignados, y actualizamos la marca mostrada.
-  const aceptarActualizacion = async () => {
-    await Promise.all([cargarTurnos(), cargarAsignados(), cargarSupaLog()]);
-    // releer la marca para dejarla como referencia nueva
-    try {
-      const { data } = await sb.from('app_meta').select('value').eq('key', 'ultima_actualizacion_stop').maybeSingle();
-      const val = data ? data.value : null;
-      stopActualizadoRef.current = val;
-      setStopActualizado(val);
-    } catch(e) {}
-    setAvisoActualizacion(false);
-  };
   const [showAbm, setShowAbm] = useState(false);
   const [showDiag, setShowDiag] = useState(false);
   const [supaLog, setSupaLog] = useState({ map:{}, totalAlfas:0, totalQuotas:0 });
@@ -896,34 +400,6 @@ function App() {
     return () => { sb.removeChannel(ch); };
   }, []);
 
-  // Asignados (grilla 3 de Gestión): mapa alfanumérico -> datos del cupo asignado.
-  const [asignados, setAsignados] = useState({});
-  const cargarAsignados = async () => {
-    try {
-      const rows = await cargarAsignadosSupabase();
-      const m = {};
-      rows.forEach(a => {
-        const k = normClave(a.alfanumerico);
-        if (k) m[k] = {
-          cliente: a.client_name || '',
-          producto: limpiarProducto(a.product || ''),
-          destino: limpiarCuit(a.destino || ''),
-          comprador: limpiarCuit(a.destinatario || a.batch_comprador || ''),
-          fecha: parseFecha(a.date || ''),
-          estado: a.estado_alfanumerico || ''
-        };
-      });
-      setAsignados(m);
-    } catch(e) { console.error('Error cargando asignados', e); }
-  };
-  useEffect(() => {
-    cargarAsignados();
-    const ch = sb.channel('rt_assigned_cliente')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'assigned_quotas' }, () => cargarAsignados())
-      .subscribe();
-    return () => { sb.removeChannel(ch); };
-  }, []);
-
   // Clientes: se leen de Supabase (Gestión Logística) al abrir y con el botón de refresco.
   const cargarClientes = async () => {
     setClientesEstado('cargando'); setClientesError('');
@@ -951,13 +427,7 @@ function App() {
       setSupaLogEstado('error');
     }
   };
-  useEffect(() => {
-    cargarSupaLog();
-    const ch = sb.channel('rt_disponibilidad')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'quota_alfanumericos' }, () => cargarSupaLog())
-      .subscribe();
-    return () => { sb.removeChannel(ch); };
-  }, []);
+  useEffect(() => { cargarSupaLog(); }, []);
 
 
   const refrescoEnCurso = useRef(false);
@@ -1009,8 +479,20 @@ function App() {
   };
 
   useEffect(() => {
-    // JSONP de Logística retirado (Etapa 2): el cruce ahora es 100% contra Supabase.
-    setLogisticaEstado('ok');
+    // Mostrar inmediatamente la última copia exitosa, mientras en segundo plano buscamos cambios.
+    try {
+      const cache = JSON.parse(localStorage.getItem(STORAGE_LOGISTICA) || 'null');
+      if (cache && Array.isArray(cache.registros) && cache.registros.length) {
+        setLogistica(cache.registros);
+        setLogisticaActualizada(cache.actualizado || null);
+        setLogisticaEstado('ok');
+      }
+    } catch(e) { console.warn('Caché de Logística inválida', e); }
+
+    const inicio = setTimeout(() => refrescarLogistica(true), 250);
+    // 5 minutos reduce carga sobre Apps Script; cada ciclo ya tiene reintento automático.
+    const t = setInterval(() => refrescarLogistica(true), 300000);
+    return () => { clearTimeout(inicio); clearInterval(t); };
   }, []);
 
   // Mapa CUIT -> repre para el cruce rápido
@@ -1077,116 +559,82 @@ function App() {
   }, [logistica]);
 
   const registros = useMemo(() => {
-    const dispMap = supaLog.map || {}; // alfanuméricos que están en Disponibilidad de Cupos
-    const idsStop = new Set(Object.keys(data).map(id => normClave(id)));
+    // 1) Turnos de STOP enriquecidos
+    const stopEnriquecidos = Object.values(data).map(r => {
+      const cuitRtte = normCuit(r.rtteComercialCuit);
+      const cuitInter = normCuit(r.intermediarioCuit);
+      const cuitOrigen = normCuit(r.origenCuit);
+      const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
+      const logEncontrado = mapaLogistica[normClave(r.id)] || null;
+      const log = esIncumplido(r.estado) ? logEncontrado : null;
+      const repreLogisticaOriginal = logEncontrado ? (logEncontrado.repreCom || '') : '';
+      const repreLogisticaCanonico = repreLogisticaOriginal ? resolverRepreABM(repreLogisticaOriginal, nombresRepreAbm) : '';
+      const repreFinal = esIncumplido(r.estado)
+        ? (repreLogisticaCanonico || '')
+        : (repreAbm || repreLogisticaCanonico || '');
+      // Semáforo de punto:
+      // verde = activo en STOP + en Logística
+      // rojo = activo en STOP + NO en Logística
+      // violeta = inactivo en STOP (removido) + en Logística
+      // gris = inactivo en STOP + NO en Logística
+      let semaforo;
+      if (r.activoEnStop !== false) {
+        semaforo = logEncontrado ? 'verde' : 'rojo';
+      } else {
+        semaforo = logEncontrado ? 'violeta' : 'gris';
+      }
+      return {
+        ...r,
+        logistica: logEncontrado,
+        clienteLogistica: log ? (log.cliente || '') : '',
+        repreLogistica: repreLogisticaCanonico,
+        repre: repreFinal,
+        cruceLogistica: log ? 'encontrado' : (esIncumplido(r.estado) ? 'sin_coincidencia' : ''),
+        semaforo,
+        fuente: 'stop'
+      };
+    });
 
-    // 1) Turnos de STOP enriquecidos (solo fecha >= corte)
-    const stopEnriquecidos = Object.values(data)
-      .filter(r => !r.fecha || r.fecha >= FECHA_CORTE)
-      .map(r => {
-        const cuitRtte = normCuit(r.rtteComercialCuit);
-        const cuitInter = normCuit(r.intermediarioCuit);
-        const cuitOrigen = normCuit(r.origenCuit);
-        const repreAbm = mapaRepre[cuitRtte] || mapaRepre[cuitInter] || mapaRepre[cuitOrigen] || '';
-        const enDisponibilidad = !!dispMap[normClave(r.id)];
-        const asig = asignados[normClave(r.id)];
-        // Semáforo:
-        // rojo = turno en STOP que NO está en Disponibilidad de Cupos (hay que cargarlo)
-        // (sin color) = turno en STOP que ya está en Disponibilidad
-        const semaforo = enDisponibilidad ? '' : 'rojo';
+    // 2) Registros de Logística que NO están en STOP → punto negro
+    // Solo mostramos los que tengan fecha >= CUTOFF_NEGRO (inicio del seguimiento STOP).
+    const CUTOFF_NEGRO = '2026-09-14';
+    const idsStop = new Set(Object.keys(data).map(id => normClave(id)));
+    const soloLogistica = logistica
+      .filter(l => {
+        const k = normClave(l.alfanumerico || l.stop || l.codigo || '');
+        if (!k || idsStop.has(k)) return false;
+        // Intentar extraer fecha del alfanumérico (DDMMYYYY embebido)
+        const raw = l.alfanumerico || l.stop || l.codigo || '';
+        const m8 = raw.match(/(\d{2})(\d{2})(\d{4})/);
+        if (m8) {
+          const iso = `${m8[3]}-${m8[2]}-${m8[1]}`;
+          if (iso < CUTOFF_NEGRO || iso > '2099-12-31') return false;
+          return true;
+        }
+        // Sin fecha parseable → no mostrar como negro
+        return false;
+      })
+      .map(l => {
+        const raw = l.alfanumerico || l.stop || l.codigo || '';
+        const m8 = raw.match(/(\d{2})(\d{2})(\d{4})/);
+        const fechaExtraida = m8 ? `${m8[3]}-${m8[2]}-${m8[1]}` : '';
         return {
-          ...r,
-          clienteAsignado: asig ? asig.cliente : '',
-          enDisponibilidad,
-          repre: repreAbm,
-          semaforo,
-          fuente: 'stop'
+          id: raw,
+          estado: '', fecha: fechaExtraida, producto: '', destino: '', localidadDestino: '',
+          comprador: '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
+          contrato: '', activoEnStop: null,
+          logistica: l,
+          clienteLogistica: l.cliente || '',
+          repreLogistica: l.repreCom || '',
+          repre: resolverRepreABM(l.repreCom || '', nombresRepreAbm),
+          cruceLogistica: 'solo_logistica',
+          semaforo: 'negro',
+          fuente: 'logistica'
         };
       });
 
-    // 2) Cupos asignados (grilla 3) que NO aparecen en el STOP → punto negro (solo fecha >= corte)
-    const soloAsignados = Object.entries(asignados)
-      .filter(([alfa, a]) => !idsStop.has(alfa) && (!a.fecha || a.fecha >= FECHA_CORTE))
-      .map(([alfa, a]) => ({
-        id: alfa,
-        estado: a.estado || '', fecha: a.fecha || '', producto: a.producto || '',
-        destino: a.destino || '', localidadDestino: '',
-        comprador: a.comprador || '', ctg: '', origen: '', intermediario: '', rtteComercial: '',
-        contrato: '', activoEnStop: null,
-        clienteAsignado: a.cliente || '',
-        enDisponibilidad: true,
-        repre: '',
-        semaforo: 'negro',
-        fuente: 'asignado'
-      }));
-
-    return [...stopEnriquecidos, ...soloAsignados];
-  }, [data, mapaRepre, asignados, supaLog]);
-
-  // Abre la carga de cupos hacia Disponibilidad con los turnos seleccionados.
-  const abrirCargaCupos = (ids, onDone) => {
-    const sel = registros.filter(r => ids.includes(r.id));
-    if (!sel.length) return;
-    const r0 = sel[0];
-    // Pre-armamos el editData con los datos que trae el STOP + los alfanuméricos
-    const editData = {
-      fullCpData: {
-        fechaCupo: r0.fecha || '', producto: r0.producto || '', comprador: r0.comprador || '',
-        observacionesCalidad: '', rteVentaPrimaria: '', rteVentaSecundaria: '', rteVentaSecundaria2: '',
-        mercadoTermino: '', corredorPrimaria: '', corredorSecundaria: '', repreEntregador: '', repreRecibidor: '',
-        destinatario: r0.comprador || '', destino: r0.destino || '', nroPlanta: '', direccionDestino: '',
-        localidad: r0.localidadDestino || '', provincia: '', observaciones: ''
-      },
-      alfanumericos: sel.map(r => r.id),
-      _desdeAnalisis: true
-    };
-    setCargaCupos({ editData, onDone });
-  };
-
-  // Guarda los cupos en Disponibilidad (buyer_quotas + quota_alfanumericos). Opción A: siempre lote nuevo.
-  const guardarCuposEnDisponibilidad = async (batchData) => {
-    try {
-      const payload = {
-        fecha_cupo: batchData.fechaCupo || null,
-        producto: batchData.producto,
-        comprador: limpiarCuit(batchData.comprador),
-        rte_comercial_primaria: limpiarCuit(batchData.rteVentaPrimaria),
-        rte_comercial_secundaria: limpiarCuit(batchData.rteVentaSecundaria) || limpiarCuit(batchData.rteVentaSecundaria2),
-        corredor_primaria: limpiarCuit(batchData.corredorPrimaria),
-        corredor_secundaria: limpiarCuit(batchData.corredorSecundaria),
-        obs_calidad: batchData.observacionesCalidad,
-        destinatario: limpiarCuit(batchData.destinatario),
-        destino: limpiarCuit(batchData.destino),
-        condicion: 'C/Descarga',
-        comp_vend_a3: limpiarCuit(batchData.mercadoTermino),
-        observaciones: batchData.observaciones,
-        full_cp_data: batchData
-      };
-      const { data, error: e1 } = await sb.from('buyer_quotas').insert(payload).select().single();
-      if (e1) throw e1;
-      const quotaId = data.id;
-
-      if (batchData.alfanumericosList && batchData.alfanumericosList.length > 0) {
-        const { data: existing } = await sb.from('quota_alfanumericos').select('code').eq('buyer_quota_id', quotaId);
-        const existingCodes = new Set((existing || []).map(a => a.code));
-        const toInsert = batchData.alfanumericosList
-          .filter(c => !existingCodes.has(c))
-          .map(c => ({ buyer_quota_id: quotaId, code: c, status: 'disponible' }));
-        if (toInsert.length > 0) {
-          const { error: e2 } = await sb.from('quota_alfanumericos').insert(toInsert);
-          if (e2) throw e2;
-        }
-      }
-
-      const onDone = cargaCupos && cargaCupos.onDone;
-      setCargaCupos(null);
-      if (onDone) onDone();
-      await cargarSupaLog(); // refrescar qué alfanuméricos están en Disponibilidad (actualiza puntos rojos)
-      alert(`✅ Cupos agregados a Disponibilidad.\n\n• Lote creado para ${payload.producto} — ${payload.destinatario}\n• Alfanuméricos cargados: ${(batchData.alfanumericosList||[]).length}`);
-    } catch (e) {
-      alert('Error al guardar en Disponibilidad: ' + e.message);
-    }
-  };
+    return [...stopEnriquecidos, ...soloLogistica];
+  }, [data, mapaRepre, mapaLogistica, nombresRepreAbm, logistica]);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -1202,23 +650,25 @@ function App() {
           </div>
           <div className="flex items-center gap-2">
             <span className={`text-[11px] font-bold px-2 py-1 rounded ${turnosEstado==='ok'?'bg-emerald-900/40 text-emerald-100':turnosEstado==='error'?'bg-red-900/50 text-red-100':'bg-amber-900/40 text-amber-100'}`}>
-              {turnosEstado==='ok' ? `${registros.length} turnos` : turnosEstado==='error' ? 'Turnos ERROR' : 'Cargando turnos...'}
+              {turnosEstado==='ok' ? `${registros.length} turnos` : turnosEstado==='error' ? 'Turnos ERROR' : 'Cargando turnos...'} {lastUpdate && `· ${new Date(lastUpdate).toLocaleString('es-AR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'})}`}
             </span>
-            <span className="text-[11px] text-emerald-100 bg-emerald-900/40 px-2 py-1 rounded" title="Fecha de la última importación del STOP (se hace desde Gestión Logística)">
-              STOP: {stopActualizado ? new Date(stopActualizado).toLocaleString('es-AR', {day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'}) : 'sin datos'}
-            </span>
+            <button onClick={() => refrescarLogistica(false)} className={`text-[11px] font-bold px-2 py-1 rounded border ${logisticaEstado==='ok'?'bg-emerald-900/40 border-emerald-500/40 text-emerald-100':logisticaEstado==='error'?'bg-red-900/50 border-red-400/40 text-red-100':'bg-amber-900/40 border-amber-400/40 text-amber-100'}`} title={logisticaEstado==='error'?logisticaError:'Actualizar Logística ahora'}>
+              {logisticaEstado==='ok' ? `● Logística ${logistica.length}` : logisticaEstado==='error' ? '● Logística ERROR' : '● Conectando Logística...'}
+            </button>
+            <label className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg cursor-pointer transition shadow-sm ${processing ? 'bg-slate-400 cursor-wait' : 'bg-white text-emerald-800 hover:bg-emerald-50'}`}>
+              <IconUpload className="w-4 h-4"/>{processing ? (uploadProg || 'Procesando...') : 'Subir Excel STOP'}
+              <input type="file" accept=".xlsx,.xls" onChange={handleUpload} disabled={processing} className="hidden"/>
+            </label>
+            <button onClick={()=>setShowAbm(true)} className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm border ${clientesEstado==='ok'?'bg-emerald-900/50 text-white hover:bg-emerald-900/70 border-emerald-600/40':clientesEstado==='error'?'bg-red-900/50 text-red-100 border-red-400/40':'bg-amber-900/40 text-amber-100 border-amber-400/40'}`} title={clientesEstado==='error'?('Clientes: '+clientesError):'Ver clientes / representantes (se editan en Gestión Logística)'}>
+              <IconUsers className="w-4 h-4"/> Clientes {clientesEstado==='ok' ? clientes.length : clientesEstado==='error' ? 'ERROR' : '...'}
+            </button>
+            <button onClick={()=>setShowDiag(true)} className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm border ${supaLogEstado==='ok'?'bg-indigo-900/50 text-indigo-100 hover:bg-indigo-900/70 border-indigo-500/40':supaLogEstado==='error'?'bg-red-900/50 text-red-100 border-red-400/40':'bg-amber-900/40 text-amber-100 border-amber-400/40'}`} title="Diagnóstico: comparar cruce SIN CTG entre JSONP y Supabase">
+              Diag. {supaLogEstado==='ok' ? supaLog.totalAlfas : supaLogEstado==='error' ? 'ERROR' : '...'}
+            </button>
+            <button onClick={borrarTodo} className="bg-red-900/40 hover:bg-red-700 text-red-100 p-1.5 rounded-lg transition" title="Borrar todos los datos"><IconTrash className="w-4 h-4"/></button>
           </div>
         </div>
       </div>
-
-      {/* AVISO SUTIL DE NUEVA ACTUALIZACIÓN DE STOP */}
-      {avisoActualizacion && (
-        <div className="fixed top-3 right-3 z-50 bg-orange-500 text-white rounded-lg shadow-lg px-4 py-2.5 flex items-center gap-3" style={{maxWidth:'340px'}}>
-          <div className="text-xs font-bold leading-tight">Hay una nueva actualización de STOP disponible.</div>
-          <button onClick={aceptarActualizacion} className="bg-white text-orange-600 hover:bg-orange-50 text-xs font-bold px-3 py-1 rounded shadow shrink-0">Actualizar</button>
-          <button onClick={()=>setAvisoActualizacion(false)} className="text-orange-100 hover:text-white text-lg leading-none shrink-0" title="Descartar por ahora">×</button>
-        </div>
-      )}
 
       {/* TABS */}
       <div className="bg-white border-b border-slate-200 px-4 flex gap-1">
@@ -1240,19 +690,11 @@ function App() {
             <p className="font-bold">No hay datos cargados</p>
             <p className="text-sm">Subí un Excel del STOP para empezar.</p>
           </div>
-        ) : tab === 'detalle' ? <DetalleTab registros={registros} abrirCargaCupos={abrirCargaCupos}/> : tab === 'semanal' ? <SemanalTab registros={registros}/> : <SemanalRepreTab registros={registros}/>}
+        ) : tab === 'detalle' ? <DetalleTab registros={registros}/> : tab === 'semanal' ? <SemanalTab registros={registros}/> : <SemanalRepreTab registros={registros}/>}
       </div>
 
       {showAbm && <VisorClientes clientes={clientes} estado={clientesEstado} error={clientesError} onRefresh={cargarClientes} onClose={()=>setShowAbm(false)}/>}
-      {cargaCupos && <AddCuposModal
-        editData={cargaCupos.editData}
-        templates={cpTemplates}
-        destinos={destinos}
-        intervinientes={intervinientes}
-        saveTemplate={()=>alert('Guardar plantilla se habilita en el próximo paso.')}
-        onSave={(data)=>guardarCuposEnDisponibilidad(data)}
-        onClose={()=>setCargaCupos(null)}
-      />}
+      {showDiag && <DiagLogistica registros={registros} logisticaMap={mapaLogistica} logisticaCount={logistica.length} supaLog={supaLog} estado={supaLogEstado} error={supaLogError} onRefresh={cargarSupaLog} onClose={()=>setShowDiag(false)}/>}
     </div>
   );
 }
@@ -1423,7 +865,7 @@ function DiagLogistica({ registros, logisticaMap, logisticaCount, supaLog, estad
 }
 
 // ==================== TAB DETALLE ====================
-function DetalleTab({ registros, abrirCargaCupos }) {
+function DetalleTab({ registros }) {
   const [fDesde, setFDesde] = useState('');
   const [fHasta, setFHasta] = useState('');
   const [fDia, setFDia] = useState(() => isoDeDate(new Date()));
@@ -1434,7 +876,7 @@ function DetalleTab({ registros, abrirCargaCupos }) {
   const [fInter, setFInter] = useState('');
   const [fClienteLog, setFClienteLog] = useState('');
   const [fEstado, setFEstado] = useState('');
-  const [fSemaforo, setFSemaforo] = useState(new Set(['normal','rojo','negro']));
+  const [fSemaforo, setFSemaforo] = useState(new Set(['verde','rojo','violeta','negro','gris']));
   const [showSemaforoMenu, setShowSemaforoMenu] = useState(false);
   const toggleSemaforo = (color) => setFSemaforo(prev => {
     const next = new Set(prev);
@@ -1444,23 +886,6 @@ function DetalleTab({ registros, abrirCargaCupos }) {
   const [fCumplimiento, setFCumplimiento] = useState('');
   const [sortCol, setSortCol] = useState('fecha');
   const [sortDir, setSortDir] = useState('asc'); // 'asc' o 'desc'
-
-  // Selección de turnos con punto rojo para cargarlos a Disponibilidad de Cupos
-  const [seleccion, setSeleccion] = useState(new Set()); // set de ids seleccionados
-  // Clave de coincidencia: producto + destinatario + destino + fecha
-  const claveCoincidencia = (r) => [r.producto, r.comprador, r.destino, r.localidadDestino, r.fecha].map(x => (x||'').toString().trim().toUpperCase()).join('||');
-  // Cuando hay selección, calculamos la clave de referencia (la del primer seleccionado)
-  const clavesSeleccionadas = useMemo(() => {
-    const s = new Set();
-    registros.forEach(r => { if (seleccion.has(r.id)) s.add(claveCoincidencia(r)); });
-    return s;
-  }, [seleccion, registros]);
-  const toggleSeleccion = (id) => setSeleccion(prev => {
-    const next = new Set(prev);
-    next.has(id) ? next.delete(id) : next.add(id);
-    return next;
-  });
-  const limpiarSeleccion = () => setSeleccion(new Set());
 
   const toggleSort = (col) => {
     if (sortCol === col) setSortDir(d => d === 'asc' ? 'desc' : 'asc');
@@ -1472,7 +897,7 @@ function DetalleTab({ registros, abrirCargaCupos }) {
   const repres = useMemo(() => [...new Set(registros.map(r=>r.repre).filter(Boolean))].sort(), [registros]);
   const origenes = useMemo(() => [...new Set(registros.map(r=>r.origen).filter(Boolean))].sort(), [registros]);
   const intermediarios = useMemo(() => [...new Set(registros.map(r=>r.intermediario).filter(Boolean))].sort(), [registros]);
-  const clientesLog = useMemo(() => [...new Set(registros.map(r=>r.clienteAsignado).filter(Boolean))].sort(), [registros]);
+  const clientesLog = useMemo(() => [...new Set(registros.map(r=>r.clienteLogistica).filter(Boolean))].sort(), [registros]);
   const estados = useMemo(() => [...new Set(registros.map(r=>r.estado).filter(Boolean))].sort(), [registros]);
 
   const filtradosBase = useMemo(() => {
@@ -1485,9 +910,9 @@ function DetalleTab({ registros, abrirCargaCupos }) {
       if (fRepre && r.repre !== fRepre) return false;
       if (fOrigen && r.origen !== fOrigen) return false;
       if (fInter && r.intermediario !== fInter) return false;
-      if (fClienteLog && r.clienteAsignado !== fClienteLog) return false;
+      if (fClienteLog && r.clienteLogistica !== fClienteLog) return false;
       if (fEstado && r.estado !== fEstado) return false;
-      if (!fSemaforo.has(r.semaforo || 'normal')) return false;
+      if (!fSemaforo.has(r.semaforo)) return false;
       return true;
     });
   }, [registros, fDia, fDesde, fHasta, fProducto, fDestino, fRepre, fOrigen, fInter, fClienteLog, fEstado, fSemaforo]);
@@ -1503,7 +928,7 @@ function DetalleTab({ registros, abrirCargaCupos }) {
     });
     const colMap = {
       fecha:'fecha', alfa:'id', estado:'estado', prod:'producto',
-      cli:'clienteAsignado', repre:'repre', origen:'origen',
+      cli:'clienteLogistica', repre:'repre', origen:'origen',
       inter:'intermediario', rtte:'rtteComercial', destino:'destino',
       loc:'localidadDestino', destinatario:'comprador', ctg:'ctg'
     };
@@ -1551,15 +976,17 @@ function DetalleTab({ registros, abrirCargaCupos }) {
           <div className="relative">
             <label className={lbl}>Estado cruce</label>
             <button onClick={()=>setShowSemaforoMenu(p=>!p)} className={selCls + " flex items-center gap-1 cursor-pointer text-left"}>
-              {fSemaforo.size===3 ? 'Todos' : fSemaforo.size===0 ? 'Ninguno' : [...fSemaforo].map(c=>({normal:'⚪',rojo:'🔴',negro:'⚫'}[c])).join('')}
+              {fSemaforo.size===5 ? 'Todos' : fSemaforo.size===0 ? 'Ninguno' : [...fSemaforo].map(c=>({verde:'🟢',rojo:'🔴',violeta:'🟣',negro:'⚫',gris:'⚪'}[c])).join('')}
             </button>
             {showSemaforoMenu && (
               <><div className="fixed inset-0 z-40" onClick={()=>setShowSemaforoMenu(false)}></div>
-              <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-xl z-50 min-w-[260px] py-1" onClick={e=>e.stopPropagation()}>
+              <div className="absolute top-full left-0 mt-1 bg-white border border-slate-200 rounded-lg shadow-xl z-50 min-w-[220px] py-1" onClick={e=>e.stopPropagation()}>
                 {[
-                  ['normal','bg-slate-300','En STOP y en Disponibilidad'],
-                  ['rojo','bg-red-500','En STOP, falta cargar en Disponibilidad'],
-                  ['negro','bg-slate-900','Asignado que no está en el STOP']
+                  ['verde','bg-emerald-500','En STOP y en Logística'],
+                  ['rojo','bg-red-500','En STOP, no en Logística'],
+                  ['violeta','bg-purple-500','Removido de STOP'],
+                  ['negro','bg-slate-900','Solo en Logística'],
+                  ['gris','bg-slate-400','Removido, no en Logística']
                 ].map(([color, bg, desc])=>(
                   <div key={color} className="flex items-center justify-between px-3 py-2 hover:bg-slate-50 cursor-pointer" onClick={()=>toggleSemaforo(color)}>
                     <div className="flex items-center gap-2">
@@ -1587,7 +1014,7 @@ function DetalleTab({ registros, abrirCargaCupos }) {
             <select value={fInter} onChange={e=>setFInter(e.target.value)} className={selCls}><option value="">Todos</option>{intermediarios.map(x=><option key={x} value={x}>{x}</option>)}</select>
           </div>
           <div>
-            <label className={lbl}>Cliente</label>
+            <label className={lbl}>Cliente Logística</label>
             <select value={fClienteLog} onChange={e=>setFClienteLog(e.target.value)} className={selCls}><option value="">Todos</option>{clientesLog.map(x=><option key={x} value={x}>{x}</option>)}</select>
           </div>
           <div>
@@ -1605,74 +1032,55 @@ function DetalleTab({ registros, abrirCargaCupos }) {
         <button onClick={()=>setFCumplimiento('incumplidos')} title="Filtrar solo incumplidos" className={`border px-3 py-1 rounded transition cursor-pointer ${fCumplimiento==='incumplidos'?'bg-red-600 text-white border-red-700 ring-2 ring-red-200':'bg-red-100 text-red-800 border-red-300 hover:bg-red-200'}`}>Incumplidos: {totIncumplidos} ({pct(totIncumplidos, filtradosBase.length)}%)</button>
       </div>
 
-      {/* BARRA DE SELECCIÓN */}
-      {seleccion.size > 0 && (
-        <div className="bg-emerald-600 text-white rounded-lg px-4 py-2 shrink-0 flex items-center justify-between shadow-md">
-          <span className="text-sm font-bold flex items-center gap-2">
-            <span className="bg-white/20 px-2 py-0.5 rounded">{seleccion.size}</span>
-            turno{seleccion.size>1?'s':''} seleccionado{seleccion.size>1?'s':''} para agregar a Disponibilidad
-          </span>
-          <div className="flex items-center gap-2">
-            <button onClick={limpiarSeleccion} className="text-xs font-bold text-emerald-100 hover:text-white px-3 py-1.5">Limpiar selección</button>
-            <button onClick={()=>abrirCargaCupos([...seleccion], limpiarSeleccion)} className="bg-white text-emerald-700 hover:bg-emerald-50 text-sm font-bold px-4 py-1.5 rounded-lg shadow flex items-center gap-1.5">
-              <span className="text-lg leading-none">+</span> Agregar Cupos
-            </button>
-          </div>
-        </div>
-      )}
-
       {/* GRILLA */}
       <div className="flex-1 overflow-auto custom-scroll bg-white rounded-lg border border-slate-200">
         <table className="w-full text-left text-xs border-collapse">
           <thead className="sticky top-0 bg-slate-100 z-10">
             <tr>
-              <th className="p-1.5 border-b border-slate-200 w-8"></th>
-              {[['Fecha','fecha'],['Alfa','alfa'],['Estado','estado'],['Prod.','prod'],['Cliente','cli'],['Repre/Com.','repre'],['Origen','origen'],['Intermediario','inter'],['Rtte. Com.','rtte'],['Destinatario','destinatario'],['Destino','destino'],['Loc. Destino','loc'],['CTG','ctg']].map(([label,col])=>
+              {[['Fecha','fecha'],['Alfa','alfa'],['Estado','estado'],['Prod.','prod'],['Cli. Logística','cli'],['Repre/Com.','repre'],['Origen','origen'],['Intermediario','inter'],['Rtte. Com.','rtte'],['Destino','destino'],['Loc. Destino','loc'],['Destinatario','destinatario'],['CTG','ctg']].map(([label,col])=>
               <th key={col} onClick={()=>toggleSort(col)} className="p-1.5 font-bold text-slate-600 border-b border-slate-200 whitespace-nowrap cursor-pointer hover:bg-slate-200 select-none">
                 {label} {sortCol===col ? (sortDir==='asc'?'▲':'▼') : <span className="text-slate-300">⇅</span>}
               </th>)}</tr>
           </thead>
           <tbody>
             {filtrados.map((r,i)=>{
+              const sc = r.cruceLogistica==='sin_coincidencia';
+              const sinc = <span className="text-[10px] font-bold px-1 py-0.5 rounded bg-amber-100 text-amber-700">SIN COINC.</span>;
               const guion = <span className="text-slate-300">—</span>;
-              const esRojo = r.semaforo==='rojo';
-              const seleccionado = seleccion.has(r.id);
-              // Coincide con lo ya seleccionado (mismo producto+destinatario+destino+fecha) y es rojo
-              const coincide = esRojo && !seleccionado && clavesSeleccionadas.size>0 && clavesSeleccionadas.has(claveCoincidencia(r));
-              const bgClase = seleccionado ? 'bg-emerald-200' : coincide ? 'bg-emerald-50' : 'even:bg-slate-50 hover:bg-emerald-50';
               return (
-              <tr key={r.id+i} className={`${bgClase} transition`}>
-                <td className="px-1 py-1 border-b border-slate-100 text-center">
-                  {esRojo && <input type="checkbox" checked={seleccionado} onChange={()=>toggleSeleccion(r.id)} className="cursor-pointer" title="Seleccionar para agregar a Disponibilidad de Cupos"/>}
-                </td>
+              <tr key={r.id+i} className="even:bg-slate-50 hover:bg-emerald-50 transition">
                 <td className="px-1 py-1 border-b border-slate-100 whitespace-nowrap text-[11px]">{fechaDisplay(r.fecha)}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100 font-bold text-slate-700 whitespace-nowrap">
                   <span className="inline-flex items-center gap-1">
                     <span className={`inline-block w-2.5 h-2.5 rounded-full shrink-0 ${
+                      r.semaforo==='verde'?'bg-emerald-500':
                       r.semaforo==='rojo'?'bg-red-500':
+                      r.semaforo==='violeta'?'bg-purple-500':
                       r.semaforo==='negro'?'bg-slate-900':
-                      'bg-transparent'}`} title={
-                      r.semaforo==='rojo'?'En STOP, NO está en Disponibilidad de Cupos':
-                      r.semaforo==='negro'?'Cupo asignado que NO aparece en el STOP':
-                      'En STOP y en Disponibilidad'}></span>
+                      'bg-slate-400'}`} title={
+                      r.semaforo==='verde'?'En STOP y en Logística':
+                      r.semaforo==='rojo'?'En STOP, NO en Logística':
+                      r.semaforo==='violeta'?'Removido de STOP, sigue en Logística':
+                      r.semaforo==='negro'?'Solo en Logística, nunca en STOP':
+                      'Removido de STOP, no en Logística'}></span>
                     <span>{r.id}</span>
                   </span>
                 </td>
                 <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap"><span className={`px-1 py-0.5 rounded text-[10px] font-bold ${esIncumplido(r.estado)?'bg-red-100 text-red-700':'bg-emerald-100 text-emerald-700'}`}>{r.estado}</span></td>
                 <td className="px-1.5 py-1 border-b border-slate-100 font-bold text-emerald-700">{r.producto}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.clienteAsignado}>{r.clienteAsignado || guion}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap">{r.repre ? <span className="font-bold text-indigo-700">{r.repre}</span> : guion}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.origen}>{r.origen || guion}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.intermediario}>{r.intermediario || guion}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.rtteComercial}>{r.rtteComercial || guion}</td>
-                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.comprador}>{r.comprador || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.clienteLogistica}>{r.clienteLogistica || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 whitespace-nowrap">{sc ? sinc : (r.repre ? <span className="font-bold text-indigo-700">{r.repre}</span> : guion)}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.origen}>{sc ? sinc : r.origen}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.intermediario}>{sc ? sinc : (r.intermediario || guion)}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={sc?'SIN COINCIDENCIA':r.rtteComercial}>{sc ? sinc : (r.rtteComercial || guion)}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.destino}>{r.destino || guion}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100 max-w-[180px] truncate" title={r.localidadDestino}>{r.localidadDestino || guion}</td>
+                <td className="px-1.5 py-1 border-b border-slate-100 max-w-[150px] truncate" title={r.comprador}>{r.comprador || guion}</td>
                 <td className="px-1.5 py-1 border-b border-slate-100">{r.ctg}</td>
               </tr>
               );
             })}
-            {filtrados.length===0 && <tr><td colSpan="14" className="p-8 text-center text-slate-400 italic">No hay turnos que coincidan con los filtros.</td></tr>}
+            {filtrados.length===0 && <tr><td colSpan="13" className="p-8 text-center text-slate-400 italic">No hay turnos que coincidan con los filtros.</td></tr>}
           </tbody>
         </table>
       </div>
