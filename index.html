@@ -1124,7 +1124,7 @@ function App() {
   }, [data, mapaRepre, asignados, supaLog]);
 
   // Abre la carga de cupos hacia Disponibilidad con los turnos seleccionados.
-  const abrirCargaCupos = (ids) => {
+  const abrirCargaCupos = (ids, onDone) => {
     const sel = registros.filter(r => ids.includes(r.id));
     if (!sel.length) return;
     const r0 = sel[0];
@@ -1140,7 +1140,52 @@ function App() {
       alfanumericos: sel.map(r => r.id),
       _desdeAnalisis: true
     };
-    setCargaCupos({ editData });
+    setCargaCupos({ editData, onDone });
+  };
+
+  // Guarda los cupos en Disponibilidad (buyer_quotas + quota_alfanumericos). Opción A: siempre lote nuevo.
+  const guardarCuposEnDisponibilidad = async (batchData) => {
+    try {
+      const payload = {
+        fecha_cupo: batchData.fechaCupo || null,
+        producto: batchData.producto,
+        comprador: limpiarCuit(batchData.comprador),
+        rte_comercial_primaria: limpiarCuit(batchData.rteVentaPrimaria),
+        rte_comercial_secundaria: limpiarCuit(batchData.rteVentaSecundaria) || limpiarCuit(batchData.rteVentaSecundaria2),
+        corredor_primaria: limpiarCuit(batchData.corredorPrimaria),
+        corredor_secundaria: limpiarCuit(batchData.corredorSecundaria),
+        obs_calidad: batchData.observacionesCalidad,
+        destinatario: limpiarCuit(batchData.destinatario),
+        destino: limpiarCuit(batchData.destino),
+        condicion: 'C/Descarga',
+        comp_vend_a3: limpiarCuit(batchData.mercadoTermino),
+        observaciones: batchData.observaciones,
+        full_cp_data: batchData
+      };
+      const { data, error: e1 } = await sb.from('buyer_quotas').insert(payload).select().single();
+      if (e1) throw e1;
+      const quotaId = data.id;
+
+      if (batchData.alfanumericosList && batchData.alfanumericosList.length > 0) {
+        const { data: existing } = await sb.from('quota_alfanumericos').select('code').eq('buyer_quota_id', quotaId);
+        const existingCodes = new Set((existing || []).map(a => a.code));
+        const toInsert = batchData.alfanumericosList
+          .filter(c => !existingCodes.has(c))
+          .map(c => ({ buyer_quota_id: quotaId, code: c, status: 'disponible' }));
+        if (toInsert.length > 0) {
+          const { error: e2 } = await sb.from('quota_alfanumericos').insert(toInsert);
+          if (e2) throw e2;
+        }
+      }
+
+      const onDone = cargaCupos && cargaCupos.onDone;
+      setCargaCupos(null);
+      if (onDone) onDone();
+      await cargarSupaLog(); // refrescar qué alfanuméricos están en Disponibilidad (actualiza puntos rojos)
+      alert(`✅ Cupos agregados a Disponibilidad.\n\n• Lote creado para ${payload.producto} — ${payload.destinatario}\n• Alfanuméricos cargados: ${(batchData.alfanumericosList||[]).length}`);
+    } catch (e) {
+      alert('Error al guardar en Disponibilidad: ' + e.message);
+    }
   };
 
   return (
@@ -1205,7 +1250,7 @@ function App() {
         destinos={destinos}
         intervinientes={intervinientes}
         saveTemplate={()=>alert('Guardar plantilla se habilita en el próximo paso.')}
-        onSave={(data)=>{ console.log('Cupos a guardar:', data); alert('Autocompletado OK. El guardado a Disponibilidad se conecta en el próximo paso.'); setCargaCupos(null); }}
+        onSave={(data)=>guardarCuposEnDisponibilidad(data)}
         onClose={()=>setCargaCupos(null)}
       />}
     </div>
@@ -1569,7 +1614,7 @@ function DetalleTab({ registros, abrirCargaCupos }) {
           </span>
           <div className="flex items-center gap-2">
             <button onClick={limpiarSeleccion} className="text-xs font-bold text-emerald-100 hover:text-white px-3 py-1.5">Limpiar selección</button>
-            <button onClick={()=>abrirCargaCupos([...seleccion])} className="bg-white text-emerald-700 hover:bg-emerald-50 text-sm font-bold px-4 py-1.5 rounded-lg shadow flex items-center gap-1.5">
+            <button onClick={()=>abrirCargaCupos([...seleccion], limpiarSeleccion)} className="bg-white text-emerald-700 hover:bg-emerald-50 text-sm font-bold px-4 py-1.5 rounded-lg shadow flex items-center gap-1.5">
               <span className="text-lg leading-none">+</span> Agregar Cupos
             </button>
           </div>
