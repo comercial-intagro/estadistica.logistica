@@ -58,6 +58,30 @@ async function cargarClientesSupabase() {
   return todos.map(c => ({ cliente: c.cliente || '', cuit: c.cuit || '', repre: c.repre_comercial || '' }));
 }
 
+// Carga de tablas para el formulario de carga de cupos (destinos, intervinientes, plantillas)
+async function cargarTablaSupabase(tabla, cols, orderBy) {
+  const pageSize = 1000;
+  let desde = 0, todos = [];
+  for (;;) {
+    let q = sb.from(tabla).select(cols).range(desde, desde + pageSize - 1);
+    if (orderBy) q = q.order(orderBy, { ascending: true });
+    const { data, error } = await q;
+    if (error) throw error;
+    todos = todos.concat(data || []);
+    if (!data || data.length < pageSize) break;
+    desde += pageSize;
+  }
+  return todos;
+}
+const mapDestinoFromDb = (d) => ({
+  id: d.id, idDestino: d.id_destino || '', cuit: d.cuit || '', descripcion: d.descripcion || '',
+  codigoPlanta: d.codigo_planta || '', direccion: d.direccion || '', localidad: d.localidad || '',
+  provincia: d.provincia || '', producto: d.producto || '', zonaComercial: d.zona_comercial || '',
+  subZonaComercial: d.sub_zona_comercial || ''
+});
+const mapIntervinienteFromDb = (i) => ({ id: i.id, cuit: i.cuit || '', descripcion: i.descripcion || '' });
+const mapTemplateFromDb = (t) => ({ id: t.id, name: t.name, data: t.data });
+
 // DIAGNÓSTICO 3b: lee quota_alfanumericos + buyer_quotas para comparar el cruce de
 // SIN CTG contra la fuente actual (JSONP). Devuelve un mapa por alfanumérico normalizado.
 async function cargarAlfasSupabase() {
@@ -385,6 +409,389 @@ async function upsertTurnosSupabase(registros, onProgreso) {
 }
 
 // ==================== APP ====================
+// ==================== FORMULARIO DE CARGA DE CUPOS (portado de Gestión) ====================
+// Objeto Icons compatible con el formulario portado (usa el componente Icon base de esta app).
+const Icons = {
+  X: (p) => <Icon {...p} d={<><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></>} />,
+  Save: (p) => <Icon {...p} d={<><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></>} />,
+  Layers: (p) => <Icon {...p} d={<><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></>} />,
+  Clipboard: (p) => <Icon {...p} d={<><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></>} />,
+  CheckCircle: (p) => <Icon {...p} d={<><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></>} />,
+  ListChecks: (p) => <Icon {...p} d={<><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></>} />,
+  RefreshCw: (p) => <Icon {...p} d={<><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></>} />,
+  Search: (p) => <Icon {...p} d={<><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></>} />,
+};
+
+        const MOCK_OPTIONS = {
+            productos: ['SOJA', 'MAIZ', 'TRIGO', 'GIRASOL', 'SORGO', 'CEBADA'],
+            compradores: [
+                'BUNGE ARGENTINA S.A.', 'CARGILL S.A.C.I.', 'LDC ARGENTINA S.A.', 
+                'VITERRA ARGENTINA S.A.', 'ACA COOP. LTDA.', 'AFA S.C.L.', 
+                'JUMEIRA AGRO S.A.', 'ARGENTRADING S.A.', 'MERLO Y MANAVELLA S.A.',
+                'MOLINOS AGRO S.A.', 'INTAGRO SOCIEDAD ANONIMA', 'MADER SAS',
+                'AVANZAR SRL', 'ADM SA'
+            ],
+            empresas: [
+                '30500175829 - BUNGE ARGENTINA S.A.', 
+                '30506730038 - CARGILL S.A.C.I.', 
+                '30501111113 - LDC ARGENTINA S.A.', 
+                '30712577670 - VITERRA ARGENTINA S.A.', 
+                '30500120889 - ACA COOP. LTDA.', 
+                '30500132399 - AFA S.C.L.', 
+                '30708912345 - JUMEIRA AGRO S.A.', 
+                '30711629048 - ARGENTRADING S.A.', 
+                '30526412792 - MERLO Y MANAVELLA S.A.',
+                '30715118773 - MOLINOS AGRO S.A.',
+                '30663290262 - INTAGRO SOCIEDAD ANONIMA',
+                '30716281074 - MADER SAS',
+                '30714505674 - ADM SA'
+            ],
+            mercados: ['30500006509 - MATBA ROFEX S.A.', 'Física', 'Directo'],
+            destinos: [
+                '30700755434 - TERMINAL 6 S.A.', 
+                '30506730038 - PLANTA ALVEAR (CARGILL)', 
+                '30500175829 - BUNGE PUERTO G.S.M.', 
+                '30710461879 - RENOVA TIMBUES', 
+                '30501111113 - LDC GENERAL LAGOS', 
+                '30715118773 - MOLINOS AGRO (SAN LORENZO)',
+                '30715118773 - ZONA ROSARIO NORTE', 
+                '30715118773 - ZONA ROSARIO SUR',
+                '30714505674 - ADM SA - El Transito Pto. Gral. San Martin',
+                '30714505674 - ADM SA - Arroyo Seco'
+            ],
+            localidades: ['San Lorenzo', 'Timbúes', 'Puerto Gral. San Martín', 'Rosario', 'General Lagos', 'San Nicolás', 'Bahía Blanca', 'Arroyo Seco'],
+            provincias: ['Santa Fe', 'Buenos Aires', 'Córdoba', 'Entre Ríos']
+        };
+
+        const TolerantSelect = ({ value, onChange, options, className, placeholder = 'Seleccionar...' }) => {
+            const opts = useMemo(() => {
+                const base = (options || []).filter(Boolean);
+                const v = (value || '').toString();
+                if (v && !base.some(o => o === v)) return [v, ...base];
+                return base;
+            }, [options, value]);
+            return (
+                <select className={className} value={value || ''} onChange={onChange}>
+                    <option value="">{placeholder}</option>
+                    {opts.map(o => <option key={o} value={o}>{o}</option>)}
+                </select>
+            );
+        };
+
+        const FormRow = ({ label, required, children }) => (
+            <div className="flex items-center gap-4 py-1.5 border-b border-slate-200/60 last:border-0 hover:bg-blue-50/50 px-4 transition-colors">
+                <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0" title={label}>
+                    {label} {required && <span className="text-red-500">*</span>}
+                </label>
+                <div className="flex-1">
+                    {children}
+                </div>
+            </div>
+        );
+
+        function ManageAlfaModal({ batch, onClose, onSave }) {
+             const [localAlfas, setLocalAlfas] = useState([...batch.alfanumericos.map(a => typeof a === 'string' ? {code: a, status: 'disponible'} : a)]);
+             const [selected, setSelected] = useState([]);
+             const [searchTerm, setSearchTerm] = useState('');
+
+             const filteredAlfas = useMemo(() => {
+                 if (!searchTerm) return localAlfas;
+                 return localAlfas.filter(a => a.code.toLowerCase().includes(searchTerm.toLowerCase()));
+             }, [localAlfas, searchTerm]);
+
+             const toggleAll = (e) => {
+                 if (e.target.checked) {
+                     const filteredCodes = filteredAlfas.map(a => a.code);
+                     setSelected(Array.from(new Set([...selected, ...filteredCodes])));
+                 } else {
+                     const filteredCodes = filteredAlfas.map(a => a.code);
+                     setSelected(selected.filter(code => !filteredCodes.includes(code)));
+                 }
+             };
+
+             const toggleOne = (code) => setSelected(prev => prev.includes(code) ? prev.filter(c => c !== code) : [...prev, code]);
+
+             const applyStatus = (newStatus) => {
+                 if (selected.length === 0) return;
+                 setLocalAlfas(prev => prev.map(a => selected.includes(a.code) ? { ...a, status: newStatus } : a));
+                 setSelected([]);
+             };
+
+             const allFilteredSelected = filteredAlfas.length > 0 && filteredAlfas.every(a => selected.includes(a.code));
+
+             return (
+                 <div className="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
+                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-2xl flex flex-col animate-slide-in overflow-hidden border border-blue-200">
+                        <div className="bg-slate-800 p-4 flex justify-between items-center text-white shrink-0">
+                            <h3 className="font-bold flex items-center gap-2"><Icons.ListChecks className="w-5 h-5"/> Gestionar Estados - {batch.comprador}</h3>
+                            <button onClick={onClose} className="hover:text-slate-300 transition"><Icons.X className="w-5 h-5"/></button>
+                        </div>
+
+                        <div className="bg-slate-50 p-3 border-b border-slate-200 flex items-center gap-2 shrink-0">
+                            <Icons.Search className="w-5 h-5 text-slate-400" />
+                            <input type="text" placeholder="Pegar o escribir código alfanumérico..." value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="flex-1 bg-white border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all font-mono" />
+                            {searchTerm && <button onClick={() => setSearchTerm('')} className="p-2 text-slate-400 hover:text-red-500 transition rounded-md hover:bg-red-50" title="Limpiar búsqueda"><Icons.X className="w-4 h-4"/></button>}
+                        </div>
+
+                        <div className="p-4 flex-1 overflow-y-auto max-h-[55vh] bg-slate-50 custom-scroll">
+                            <table className="w-full text-left text-sm border-collapse bg-white rounded-lg shadow-sm overflow-hidden border border-slate-200">
+                                <thead className="bg-slate-100 border-b border-slate-200 sticky top-0 z-10">
+                                    <tr>
+                                        <th className="p-2 w-10 text-center"><input type="checkbox" onChange={toggleAll} checked={allFilteredSelected} className="accent-blue-600 w-3.5 h-3.5 cursor-pointer" title="Seleccionar visibles"/></th>
+                                        <th className="p-2 font-bold text-slate-600 text-xs uppercase tracking-wider">Código Alfanumérico</th>
+                                        <th className="p-2 font-bold text-slate-600 text-xs uppercase tracking-wider text-center">Estado Actual</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                    {filteredAlfas.map(alfa => (
+                                        <tr key={alfa.code} className={`hover:bg-slate-50 transition-colors ${selected.includes(alfa.code) ? 'bg-blue-50/50' : ''}`}>
+                                            <td className="p-2 text-center"><input type="checkbox" checked={selected.includes(alfa.code)} onChange={() => toggleOne(alfa.code)} className="accent-blue-600 w-3.5 h-3.5 cursor-pointer"/></td>
+                                            <td className="p-2 font-mono font-medium text-slate-700">{alfa.code}</td>
+                                            <td className="p-2 text-center">
+                                                <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase border shadow-sm ${alfa.status === 'disponible' ? 'bg-green-100 text-green-700 border-green-200' : (alfa.status === 'asignado' ? 'bg-blue-100 text-blue-700 border-blue-200' : (alfa.status === 'anulado' ? 'bg-red-100 text-red-700 border-red-200' : 'bg-orange-100 text-orange-700 border-orange-200'))}`}>{alfa.status}</span>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                    {filteredAlfas.length === 0 && <tr><td colSpan="3" className="p-6 text-center text-slate-400 italic">No se encontraron códigos que coincidan con la búsqueda.</td></tr>}
+                                </tbody>
+                            </table>
+                        </div>
+                        <div className="bg-white border-t border-slate-200 p-4 flex flex-col sm:flex-row justify-between items-center gap-4 shrink-0">
+                            <div className="text-sm font-bold text-slate-500 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200">{selected.length} seleccionados</div>
+                            <div className="flex flex-wrap gap-2 justify-center">
+                                <button onClick={() => applyStatus('anulado')} disabled={selected.length===0} className="bg-red-500 hover:bg-red-600 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg font-bold text-xs shadow-sm transition active:scale-95">ANULAR</button>
+                                <button onClick={() => applyStatus('devuelto')} disabled={selected.length===0} className="bg-orange-500 hover:bg-orange-600 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg font-bold text-xs shadow-sm transition active:scale-95">DEVOLVER</button>
+                                <button onClick={() => applyStatus('disponible')} disabled={selected.length===0} className="bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg font-bold text-xs shadow-sm transition flex items-center gap-1 active:scale-95"><Icons.RefreshCw className="w-3.5 h-3.5"/> REVERTIR</button>
+                            </div>
+                            <button onClick={() => onSave(batch.id, localAlfas)} className="bg-blue-600 hover:bg-blue-700 text-white px-6 py-2 rounded-lg font-bold text-sm shadow-md transition w-full sm:w-auto active:scale-95">Guardar Cambios</button>
+                        </div>
+                    </div>
+                 </div>
+             )
+        }
+
+        function AddCuposModal({ onClose, onSave, templates, saveTemplate, editData, destinos = [], intervinientes = [], templateMode = false }) {
+            const [alfanumericos, setAlfanumericos] = useState('');
+            const [templateName, setTemplateName] = useState('');
+            const [showAlfaModal, setShowAlfaModal] = useState(false);
+            
+            const [form, setForm] = useState({
+                fechaCupo: '', producto: '', comprador: '', observacionesCalidad: '', rteVentaPrimaria: '', rteVentaSecundaria: '', rteVentaSecundaria2: '',
+                mercadoTermino: '', corredorPrimaria: '', corredorSecundaria: '', repreEntregador: '', repreRecibidor: '',
+                destinatario: '', destino: '', nroPlanta: '', direccionDestino: '', localidad: '', provincia: '', observaciones: ''
+            });
+
+            useEffect(() => {
+                if (editData && editData.fullCpData) {
+                    setForm(editData.fullCpData);
+                    const alfaStr = (editData.alfanumericos || []).map(a => typeof a === 'object' ? a.code : a).join('\n');
+                    setAlfanumericos(alfaStr);
+                    if (editData._templateName) setTemplateName(editData._templateName);
+                }
+            }, [editData]);
+
+            const parsedCodes = useMemo(() => {
+                return alfanumericos.split(/[\s,]+/).map(s => s.trim().toUpperCase()).filter(s => s.length > 0);
+            }, [alfanumericos]);
+
+            const handleChange = (field, val) => setForm(prev => ({...prev, [field]: val}));
+
+            const handleLoadTemplate = (e) => {
+                const tName = e.target.value;
+                if (!tName) return;
+                const tmpl = templates.find(t => t.name === tName);
+                if (tmpl) setForm(tmpl.data);
+            };
+
+            const handleSaveTemplate = async () => {
+                if (!templateName.trim()) return alert("Ingresa un nombre para la plantilla.");
+                if (saveTemplate) {
+                    await saveTemplate(templateName, form);
+                    alert("Plantilla guardada con éxito.");
+                }
+                setTemplateName('');
+            };
+
+            const handleSaveBatch = () => {
+                if (parsedCodes.length === 0) return alert("Debes ingresar al menos 1 código alfanumérico. Utiliza el botón 'Pegar Alfanuméricos'.");
+                if (parsedCodes.length > 300) return alert("El máximo permitido es 300 códigos por lote.");
+                if (!form.fechaCupo) return alert("La Fecha del cupo es obligatoria.");
+                if (!form.producto || !form.comprador) return alert("Producto y Comprador son obligatorios.");
+
+                onSave({
+                    ...form,
+                    alfanumericosList: parsedCodes
+                });
+            };
+
+            // Opciones de intervinientes desde el ABM (fallback a MOCK si está vacío)
+            const intervOpts = useMemo(() => {
+                const fromAbm = (intervinientes || []).map(i => i.descripcion).filter(Boolean);
+                return fromAbm.length > 0 ? fromAbm : MOCK_OPTIONS.empresas;
+            }, [intervinientes]);
+
+            // Destinos filtrados por el producto elegido en la CP
+            const destinosFiltrados = useMemo(() => {
+                if (!form.producto) return [];
+                const prod = (form.producto || '').toUpperCase();
+                return (destinos || []).filter(d => {
+                    const dp = (d.producto || '').toUpperCase();
+                    return dp === prod || dp === 'TODOS';
+                });
+            }, [destinos, form.producto]);
+
+            // Al elegir un destino, autocompletar los datos asociados
+            const selectDestino = (descripcion) => {
+                if (!descripcion) { handleChange('destino', ''); return; }
+                const d = destinosFiltrados.find(x => x.descripcion === descripcion);
+                if (!d) { handleChange('destino', descripcion); return; }
+                setForm(prev => ({
+                    ...prev,
+                    destino: d.descripcion,
+                    nroPlanta: d.codigoPlanta || '',
+                    direccionDestino: d.direccion || '',
+                    localidad: d.localidad || '',
+                    provincia: d.provincia || '',
+                    destinoCuit: d.cuit || ''
+                }));
+            };
+
+            const onDestinoMouseDown = (e) => {
+                if (!form.producto) { e.preventDefault(); alert('Primero seleccioná el Producto de la carta de porte para poder elegir el destino.'); }
+            };
+
+            return (
+                <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
+                    <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl flex flex-col animate-slide-in border border-blue-200 relative max-h-[98vh]">
+                        
+                        {/* SUB-MODAL ALFANUMÉRICO (FLOTANTE) */}
+                        {showAlfaModal && (
+                            <div className="absolute inset-0 z-50 bg-slate-900/40 backdrop-blur-sm flex items-center justify-center p-4 rounded-xl">
+                                <div className="bg-white rounded-xl shadow-xl w-full max-w-md p-5 flex flex-col animate-slide-in border border-blue-200">
+                                    <div className="flex justify-between items-center mb-3">
+                                        <h4 className="font-bold text-blue-900 flex items-center gap-2"><Icons.Layers className="w-4 h-4"/> Pegar Alfanuméricos</h4>
+                                        <button onClick={() => setShowAlfaModal(false)} className="text-slate-400 hover:text-slate-600"><Icons.X className="w-5 h-5"/></button>
+                                    </div>
+                                    <p className="text-[11px] text-slate-500 mb-3 leading-tight">Separa los códigos por salto de línea o coma. Máximo 300 por lote.</p>
+                                    <textarea 
+                                        className="flex-1 min-h-[200px] w-full border border-slate-300 rounded-lg p-3 text-sm font-mono text-slate-700 focus:ring-2 focus:ring-blue-500 outline-none custom-scroll resize-none"
+                                        placeholder="Ej: ABC12345&#10;XYZ98765&#10;..."
+                                        value={alfanumericos}
+                                        onChange={e => setAlfanumericos(e.target.value)}
+                                    ></textarea>
+                                    <div className="mt-4 flex justify-between items-center">
+                                        <div className={`px-3 py-1.5 rounded text-center font-bold text-xs ${parsedCodes.length > 300 ? 'bg-red-100 text-red-700' : 'bg-blue-50 text-blue-800 border border-blue-200'}`}>
+                                            {parsedCodes.length} / 300 detectados
+                                        </div>
+                                        <button onClick={() => setShowAlfaModal(false)} className="bg-blue-600 hover:bg-blue-700 text-white font-bold px-6 py-2 rounded-lg shadow-sm transition active:scale-95">Listo</button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="bg-gradient-to-r from-blue-900 to-blue-700 p-3 flex justify-between items-center text-white shrink-0 rounded-t-xl">
+                            <div className="flex items-center gap-2">
+                                <Icons.Clipboard className="w-4 h-4 text-blue-300" />
+                                <h3 className="font-bold text-sm">Modelo de Carta de Porte</h3>
+                            </div>
+                            <div className="flex items-center gap-3">
+                                <button 
+                                    onClick={() => setShowAlfaModal(true)} 
+                                    className={`text-xs font-bold px-3 py-1.5 rounded-md flex items-center gap-1.5 transition shadow-sm ${parsedCodes.length > 0 ? 'bg-emerald-500 hover:bg-emerald-400 text-white' : 'bg-blue-800 hover:bg-blue-600 border border-blue-500/50'}`}
+                                >
+                                    <Icons.Layers className="w-3.5 h-3.5"/>
+                                    {parsedCodes.length > 0 ? `${parsedCodes.length} Códigos Cargados` : 'Pegar Alfanuméricos'}
+                                </button>
+                                <button onClick={onClose} className="text-blue-200 hover:text-white transition p-1"><Icons.X className="w-5 h-5" /></button>
+                            </div>
+                        </div>
+
+                        <div className="bg-blue-50/50 border-b border-blue-100 p-2.5 flex flex-wrap gap-4 items-center shadow-sm shrink-0">
+                            <div className="flex items-center gap-2 flex-1 min-w-[200px]">
+                                <span className="text-[10px] font-bold text-blue-800 uppercase whitespace-nowrap">Plantilla:</span>
+                                <select className="flex-1 p-1 border border-blue-200 rounded text-xs bg-white focus:ring-1 outline-none" onChange={handleLoadTemplate}>
+                                    <option value="">-- Cargar Existente --</option>
+                                    {templates.map(t => <option key={t.name} value={t.name}>{t.name}</option>)}
+                                </select>
+                            </div>
+                            <div className="w-px h-5 bg-blue-200 hidden md:block"></div>
+                            <div className="flex items-center gap-2 flex-1 min-w-[200px]">
+                                <span className="text-[10px] font-bold text-blue-800 uppercase whitespace-nowrap">Guardar:</span>
+                                <input type="text" placeholder="Ej: BUNGE - MAIZ" value={templateName} onChange={e=>setTemplateName(e.target.value)} className="flex-1 p-1 border border-blue-200 rounded text-xs bg-white focus:ring-1 outline-none"/>
+                                <button onClick={handleSaveTemplate} className="bg-blue-600 hover:bg-blue-700 text-white p-1 rounded transition" title="Guardar como Plantilla"><Icons.Save className="w-3.5 h-3.5"/></button>
+                            </div>
+                        </div>
+
+                        <div className="p-4 bg-slate-50 flex-1 overflow-y-auto custom-scroll">
+                            <div className="flex flex-col max-w-3xl mx-auto bg-white border border-slate-200 shadow-sm rounded-lg py-1">
+                                
+                                <div className="flex items-center gap-2 py-2 border-b-2 border-emerald-200 bg-emerald-50/60 px-4">
+                                    <label className="text-[11px] font-extrabold text-emerald-800 uppercase shrink-0">📅 Fecha del Cupo <span className="text-red-500">*</span></label>
+                                    <input type="date" value={form.fechaCupo} onChange={e=>handleChange('fechaCupo', e.target.value)} className="flex-1 max-w-[220px] p-1.5 border-2 border-emerald-300 rounded text-xs font-bold text-emerald-900 outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 bg-white transition" />
+                                    <span className="text-[10px] text-slate-500 italic">Día para el que sirven estos cupos</span>
+                                </div>
+
+                                <div className="flex flex-col md:flex-row items-start md:items-center gap-2 md:gap-4 py-1.5 border-b border-slate-200/60 hover:bg-blue-50/50 px-4 transition-colors">
+                                    <div className="flex items-center gap-2 w-full md:w-1/2">
+                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Producto <span className="text-red-500">*</span></label>
+                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.producto} onChange={e=>handleChange('producto', e.target.value)} options={MOCK_OPTIONS.productos} />
+                                    </div>
+                                    <div className="flex items-center gap-2 w-full md:w-1/2">
+                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Comprador <span className="text-red-500">*</span></label>
+                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.comprador} onChange={e=>handleChange('comprador', e.target.value)} options={intervOpts} />
+                                    </div>
+                                </div>
+
+                                <FormRow label="Observaciones Calidad"><input type="text" placeholder="Ej: Conforme, Condicional..." className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.observacionesCalidad} onChange={e=>handleChange('observacionesCalidad', e.target.value)} /></FormRow>
+                                <FormRow label="Rte. Comercial Venta Primaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.rteVentaPrimaria} onChange={e=>handleChange('rteVentaPrimaria', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Rte. Comercial Venta Secundaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.rteVentaSecundaria} onChange={e=>handleChange('rteVentaSecundaria', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Rte. Comercial Venta Secundaria 2"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.rteVentaSecundaria2} onChange={e=>handleChange('rteVentaSecundaria2', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Mercado a Término"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.mercadoTermino} onChange={e=>handleChange('mercadoTermino', e.target.value)} options={MOCK_OPTIONS.mercados} /></FormRow>
+                                <FormRow label="Corredor Venta Primaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.corredorPrimaria} onChange={e=>handleChange('corredorPrimaria', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Corredor Venta Secundaria"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.corredorSecundaria} onChange={e=>handleChange('corredorSecundaria', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Representante Entregador"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.repreEntregador} onChange={e=>handleChange('repreEntregador', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Representante Recibidor"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.repreRecibidor} onChange={e=>handleChange('repreRecibidor', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Destinatario"><TolerantSelect className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.destinatario} onChange={e=>handleChange('destinatario', e.target.value)} options={intervOpts} /></FormRow>
+                                <FormRow label="Destino"><select onMouseDown={onDestinoMouseDown} disabled={!form.producto} className={`w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition ${!form.producto ? 'bg-slate-100 cursor-not-allowed text-slate-400' : 'bg-slate-50 hover:bg-white'}`} value={form.destino} onChange={e=>selectDestino(e.target.value)}><option value="">{form.producto ? 'Seleccionar...' : 'Elegí producto primero'}</option>{form.destino && !destinosFiltrados.some(d=>d.descripcion===form.destino) && <option value={form.destino}>{form.destino}</option>}{destinosFiltrados.map(d=><option key={d.id} value={d.descripcion}>{d.descripcion}{d.codigoPlanta?` (Planta ${d.codigoPlanta})`:''}</option>)}</select></FormRow>
+
+                                <div className="flex flex-col md:flex-row items-start md:items-center gap-2 md:gap-4 py-1.5 border-b border-slate-200/60 hover:bg-blue-50/50 px-4 transition-colors">
+                                    <div className="flex items-center gap-2 w-full md:w-[35%]">
+                                        <label className="w-1/3 md:w-[45%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Nro Planta</label>
+                                        <input type="text" maxLength="6" className="w-20 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition text-center font-mono font-bold text-slate-700" value={form.nroPlanta} onChange={e=>handleChange('nroPlanta', e.target.value)}/>
+                                    </div>
+                                    <div className="flex items-center gap-2 w-full md:w-[65%]">
+                                        <label className="w-1/3 md:w-[25%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Dirección</label>
+                                        <input type="text" className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.direccionDestino} onChange={e=>handleChange('direccionDestino', e.target.value)}/>
+                                    </div>
+                                </div>
+                                
+                                <div className="flex flex-col md:flex-row items-start md:items-center gap-2 md:gap-4 py-1.5 border-b border-slate-200/60 hover:bg-blue-50/50 px-4 transition-colors">
+                                    <div className="flex items-center gap-2 w-full md:w-1/2">
+                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Localidad</label>
+                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.localidad} onChange={e=>handleChange('localidad', e.target.value)} options={MOCK_OPTIONS.localidades} />
+                                    </div>
+                                    <div className="flex items-center gap-2 w-full md:w-1/2">
+                                        <label className="w-1/3 md:w-[30%] text-[10px] font-bold text-slate-700 uppercase text-left leading-tight shrink-0">Provincia</label>
+                                        <TolerantSelect className="flex-1 p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.provincia} onChange={e=>handleChange('provincia', e.target.value)} options={MOCK_OPTIONS.provincias} />
+                                    </div>
+                                </div>
+                                
+                                <FormRow label="Observaciones Carta de Porte"><input type="text" placeholder="Escritura libre..." className="w-full p-1.5 border border-slate-300 rounded text-xs outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-slate-50 hover:bg-white transition" value={form.observaciones} onChange={e=>handleChange('observaciones', e.target.value)} /></FormRow>
+                            </div>
+                        </div>
+
+                        <div className="bg-white border-t border-slate-200 p-3 flex justify-end gap-3 shrink-0 rounded-b-xl z-20">
+                            <button onClick={onClose} className="px-5 py-2 text-sm font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-lg transition">Cancelar</button>
+                            <button onClick={handleSaveBatch} className="bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold px-6 py-2 rounded-lg shadow-md transition flex items-center gap-2 active:scale-95">
+                                <Icons.CheckCircle className="w-4 h-4"/> Guardar {parsedCodes.length} Cupos
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+
 function App() {
   const [data, setData] = useState({}); // { id: registro }
   const [turnosEstado, setTurnosEstado] = useState('cargando');
@@ -392,6 +799,25 @@ function App() {
   const [clientes, setClientes] = useState([]); // [{cliente, cuit, repre}] leídos de Supabase
   const [clientesEstado, setClientesEstado] = useState('cargando');
   const [clientesError, setClientesError] = useState('');
+  // Datos para el formulario de carga de cupos
+  const [destinos, setDestinos] = useState([]);
+  const [intervinientes, setIntervinientes] = useState([]);
+  const [cpTemplates, setCpTemplates] = useState([]);
+  const cargarDatosFormulario = async () => {
+    try {
+      const [d, i, t] = await Promise.all([
+        cargarTablaSupabase('destinos', '*', 'descripcion'),
+        cargarTablaSupabase('intervinientes', '*', 'descripcion'),
+        cargarTablaSupabase('cp_templates', '*', 'name')
+      ]);
+      setDestinos(d.map(mapDestinoFromDb));
+      setIntervinientes(i.map(mapIntervinienteFromDb));
+      setCpTemplates(t.map(mapTemplateFromDb));
+    } catch(e) { console.error('Error cargando datos del formulario', e); }
+  };
+  useEffect(() => { cargarDatosFormulario(); }, []);
+  // Estado del modal de carga de cupos (se abre desde la selección de turnos rojos)
+  const [cargaCupos, setCargaCupos] = useState(null); // null o { editData }
   const [tab, setTab] = useState('detalle');
   const [processing, setProcessing] = useState(false);
   const [lastUpdate, setLastUpdate] = useState(null);
@@ -698,16 +1124,23 @@ function App() {
   }, [data, mapaRepre, asignados, supaLog]);
 
   // Abre la carga de cupos hacia Disponibilidad con los turnos seleccionados.
-  // (El formulario portado se conecta en la próxima etapa; por ahora muestra el resumen.)
   const abrirCargaCupos = (ids) => {
     const sel = registros.filter(r => ids.includes(r.id));
     if (!sel.length) return;
     const r0 = sel[0];
-    const resumen = `Se van a cargar ${sel.length} cupo(s) a Disponibilidad:\n\n` +
-      `Producto: ${r0.producto}\nDestinatario: ${r0.comprador}\nDestino: ${r0.destino}\nFecha: ${fechaDisplay(r0.fecha)}\n\n` +
-      `Alfanuméricos:\n${sel.map(r=>r.id).join('\n')}\n\n` +
-      `(El formulario de carga se conecta en la próxima etapa, para probarlo en vivo.)`;
-    alert(resumen);
+    // Pre-armamos el editData con los datos que trae el STOP + los alfanuméricos
+    const editData = {
+      fullCpData: {
+        fechaCupo: r0.fecha || '', producto: r0.producto || '', comprador: r0.comprador || '',
+        observacionesCalidad: '', rteVentaPrimaria: '', rteVentaSecundaria: '', rteVentaSecundaria2: '',
+        mercadoTermino: '', corredorPrimaria: '', corredorSecundaria: '', repreEntregador: '', repreRecibidor: '',
+        destinatario: r0.comprador || '', destino: r0.destino || '', nroPlanta: '', direccionDestino: '',
+        localidad: r0.localidadDestino || '', provincia: '', observaciones: ''
+      },
+      alfanumericos: sel.map(r => r.id),
+      _desdeAnalisis: true
+    };
+    setCargaCupos({ editData });
   };
 
   return (
@@ -766,6 +1199,15 @@ function App() {
       </div>
 
       {showAbm && <VisorClientes clientes={clientes} estado={clientesEstado} error={clientesError} onRefresh={cargarClientes} onClose={()=>setShowAbm(false)}/>}
+      {cargaCupos && <AddCuposModal
+        editData={cargaCupos.editData}
+        templates={cpTemplates}
+        destinos={destinos}
+        intervinientes={intervinientes}
+        saveTemplate={()=>alert('Guardar plantilla se habilita en el próximo paso.')}
+        onSave={(data)=>{ console.log('Cupos a guardar:', data); alert('Autocompletado OK. El guardado a Disponibilidad se conecta en el próximo paso.'); setCargaCupos(null); }}
+        onClose={()=>setCargaCupos(null)}
+      />}
     </div>
   );
 }
